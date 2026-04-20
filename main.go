@@ -19,13 +19,18 @@ import (
 )
 
 type Message struct {
-	ID        int    `json:"id,omitempty"`
-	Username  string `json:"username"`
-	Text      string `json:"text"`
-	Timestamp string `json:"timestamp"`
-	FileURL   string `json:"fileUrl,omitempty"`
-	FileName  string `json:"fileName,omitempty"`
-	FileSize  int64  `json:"fileSize,omitempty"`
+	ID         int    `json:"id,omitempty"`
+	Username   string `json:"username"`
+	Text       string `json:"text"`
+	Timestamp  string `json:"timestamp"`
+	Type       string `json:"type,omitempty"`
+	StickerID  string `json:"stickerId,omitempty"`
+	StickerURL string `json:"stickerUrl,omitempty"`
+	StickerPack string `json:"stickerPack,omitempty"`
+	FileURL    string `json:"fileUrl,omitempty"`
+	FileName   string `json:"fileName,omitempty"`
+	FileSize   int64  `json:"fileSize,omitempty"`
+	FileType   string `json:"fileType,omitempty"` // image, audio, video, document
 }
 
 type Database struct {
@@ -82,21 +87,61 @@ func (d *Database) init() error {
 		username TEXT NOT NULL,
 		text TEXT NOT NULL,
 		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+		message_type TEXT,
+		sticker_id TEXT,
+		sticker_url TEXT,
+		sticker_pack TEXT,
 		file_url TEXT,
 		file_name TEXT,
-		file_size INTEGER
+		file_size INTEGER,
+		file_type TEXT
 	);
 	`
 	_, err := d.db.Exec(schema)
-	return err
+	if err != nil {
+		return err
+	}
+	return d.ensureColumns()
+}
+
+func (d *Database) ensureColumns() error {
+	rows, err := d.db.Query(`PRAGMA table_info(messages)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	existing := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull int
+		var dfltValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+			return err
+		}
+		existing[name] = true
+	}
+
+	columns := []string{"message_type", "sticker_id", "sticker_url", "sticker_pack"}
+	for _, col := range columns {
+		if !existing[col] {
+			if _, err := d.db.Exec(fmt.Sprintf("ALTER TABLE messages ADD COLUMN %s TEXT", col)); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 func (d *Database) SaveMessage(msg *Message) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	query := `INSERT INTO messages (username, text, timestamp, file_url, file_name, file_size) VALUES (?, ?, ?, ?, ?, ?)`
-	result, err := d.db.Exec(query, msg.Username, msg.Text, msg.Timestamp, msg.FileURL, msg.FileName, msg.FileSize)
+	query := `INSERT INTO messages (username, text, timestamp, message_type, sticker_id, sticker_url, sticker_pack, file_url, file_name, file_size, file_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	result, err := d.db.Exec(query, msg.Username, msg.Text, msg.Timestamp, msg.Type, msg.StickerID, msg.StickerURL, msg.StickerPack, msg.FileURL, msg.FileName, msg.FileSize, msg.FileType)
 	if err != nil {
 		return err
 	}
@@ -109,7 +154,7 @@ func (d *Database) GetRecentMessages(limit int) ([]Message, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	query := `SELECT id, username, text, timestamp, COALESCE(file_url, ''), COALESCE(file_name, ''), COALESCE(file_size, 0) FROM messages ORDER BY id DESC LIMIT ?`
+	query := `SELECT id, username, text, timestamp, COALESCE(message_type, ''), COALESCE(sticker_id, ''), COALESCE(sticker_url, ''), COALESCE(sticker_pack, ''), COALESCE(file_url, ''), COALESCE(file_name, ''), COALESCE(file_size, 0), COALESCE(file_type, '') FROM messages ORDER BY id DESC LIMIT ?`
 	rows, err := d.db.Query(query, limit)
 	if err != nil {
 		return nil, err
@@ -119,7 +164,7 @@ func (d *Database) GetRecentMessages(limit int) ([]Message, error) {
 	var messages []Message
 	for rows.Next() {
 		var msg Message
-		if err := rows.Scan(&msg.ID, &msg.Username, &msg.Text, &msg.Timestamp, &msg.FileURL, &msg.FileName, &msg.FileSize); err != nil {
+		if err := rows.Scan(&msg.ID, &msg.Username, &msg.Text, &msg.Timestamp, &msg.Type, &msg.StickerID, &msg.StickerURL, &msg.StickerPack, &msg.FileURL, &msg.FileName, &msg.FileSize, &msg.FileType); err != nil {
 			return nil, err
 		}
 		messages = append(messages, msg)
@@ -310,6 +355,22 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(messages)
 }
 
+// getFileType determines file type based on extension
+func getFileType(filename string) string {
+	ext := strings.ToLower(filepath.Ext(filename))
+
+	switch ext {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg":
+		return "image"
+	case ".mp3", ".wav", ".ogg", ".flac", ".aac":
+		return "audio"
+	case ".mp4", ".webm", ".avi", ".mov", ".mkv":
+		return "video"
+	default:
+		return "document"
+	}
+}
+
 func handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -322,9 +383,10 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse form with max 100MB
-	if err := r.ParseMultipartForm(100 * 1024 * 1024); err != nil {
-		http.Error(w, "File too large", http.StatusBadRequest)
+	// Parse form with max 50MB
+	maxSize := int64(50 * 1024 * 1024) // 50MB
+	if err := r.ParseMultipartForm(maxSize); err != nil {
+		http.Error(w, "File too large (max 50MB)", http.StatusBadRequest)
 		return
 	}
 
@@ -334,6 +396,12 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
+
+	// Check file size
+	if fileHeader.Size > maxSize {
+		http.Error(w, "File too large (max 50MB)", http.StatusBadRequest)
+		return
+	}
 
 	username := r.FormValue("username")
 	if username == "" {
@@ -359,14 +427,19 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Determine file type
+	fileType := getFileType(fileHeader.Filename)
+
 	// Create message with file info
 	msg := &Message{
-		Username:  username,
-		Text:      "📎 Отправил файл",
-		Timestamp: time.Now().Format("15:04:05"),
-		FileURL:   fmt.Sprintf("/uploads/%s", filepath.Base(filename)),
-		FileName:  fileHeader.Filename,
-		FileSize:  size,
+		Username:   username,
+		Text:       "📎 Отправил файл",
+		Type:       "file",
+		Timestamp:  time.Now().Format("15:04:05"),
+		FileURL:    fmt.Sprintf("/uploads/%s", filepath.Base(filename)),
+		FileName:   fileHeader.Filename,
+		FileSize:   size,
+		FileType:   fileType,
 	}
 
 	// Save to database
@@ -379,10 +452,11 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"fileUrl": msg.FileURL,
+		"success":  true,
+		"fileUrl":  msg.FileURL,
 		"fileName": msg.FileName,
 		"fileSize": msg.FileSize,
+		"fileType": msg.FileType,
 	})
 }
 

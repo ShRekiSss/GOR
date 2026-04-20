@@ -1,0 +1,24 @@
+{
+  "packs": [
+    {
+      "id": "pack1",
+      "name": "Neon Pack",
+      "stickers": [
+        {"id": "pack1-robot", "file": "pack1/robot.svg", "name": "Robot"},
+        {"id": "pack1-wave", "file": "pack1/wave.svg", "name": "Wave"},
+        {"id": "pack1-heart", "file": "pack1/heart.svg", "name": "Heart"},
+        {"id": "pack1-ghost", "file": "pack1/ghost.svg", "name": "Ghost"}
+      ]
+    },
+    {
+      "id": "pack2",
+      "name": "Pixel Pack",
+      "stickers": [
+        {"id": "pack2-thumbs", "file": "pack2/thumbs.svg", "name": "Thumbs Up"},
+        {"id": "pack2-fire", "file": "pack2/fire.svg", "name": "Fire"},
+        {"id": "pack2-sparkle", "file": "pack2/sparkle.svg", "name": "Sparkle"},
+        {"id": "pack2-music", "file": "pack2/music.svg", "name": "Music"}
+      ]
+    }
+  ]
+}

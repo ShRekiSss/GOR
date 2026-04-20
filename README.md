@@ -7,6 +7,7 @@ Retro-style messenger with WebSocket chat
 - 👥 Multiple concurrent users
 - 🔔 System notifications for user joins/leaves
 - 📱 Mobile-responsive design
+- 🎨 Стикеры и GIPHY поиск
 
 ## Installation & Setup
 
@@ -35,6 +36,8 @@ go run main.go
 ```
 
 The chat will be available at `http://localhost:8080`
+
+> Для GIPHY поиска можно задать ключ в переменной среды `REACT_APP_GIPHY_API_KEY`. Без ключа используется общий демонстрационный ключ.
 
 ### Development
 
