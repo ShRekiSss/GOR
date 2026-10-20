@@ -1,36 +1,67 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
-	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/crypto/argon2"
+	_ "modernc.org/sqlite"
 )
 
 type Message struct {
-	ID         int    `json:"id,omitempty"`
-	Username   string `json:"username"`
-	Text       string `json:"text"`
-	Timestamp  string `json:"timestamp"`
-	Type       string `json:"type,omitempty"`
-	StickerID  string `json:"stickerId,omitempty"`
-	StickerURL string `json:"stickerUrl,omitempty"`
+	ID          int    `json:"id,omitempty"`
+	ChatID      int64  `json:"chatId"`
+	UserID      int64  `json:"userId,omitempty"`
+	Username    string `json:"username"`
+	Text        string `json:"text"`
+	Timestamp   string `json:"timestamp"`
+	Type        string `json:"type,omitempty"`
+	StickerID   string `json:"stickerId,omitempty"`
+	StickerURL  string `json:"stickerUrl,omitempty"`
 	StickerPack string `json:"stickerPack,omitempty"`
-	FileURL    string `json:"fileUrl,omitempty"`
-	FileName   string `json:"fileName,omitempty"`
-	FileSize   int64  `json:"fileSize,omitempty"`
-	FileType   string `json:"fileType,omitempty"` // image, audio, video, document
+	FileURL     string `json:"fileUrl,omitempty"`
+	FileName    string `json:"fileName,omitempty"`
+	FileSize    int64  `json:"fileSize,omitempty"`
+	FileType    string `json:"fileType,omitempty"` // image, audio, video, document
+}
+
+type Chat struct {
+	ID         int64  `json:"id"`
+	Type       string `json:"type"` // direct | group
+	Title      string `json:"title"`
+	Peer       string `json:"peer,omitempty"`
+	PeerID     int64  `json:"peerId,omitempty"`
+	Unread     int    `json:"unread"`
+	LastText   string `json:"lastText,omitempty"`
+	LastSender string `json:"lastSender,omitempty"`
+	LastTime   string `json:"lastTime,omitempty"`
+}
+
+type User struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
 }
 
 type Database struct {
@@ -40,7 +71,7 @@ type Database struct {
 
 type Hub struct {
 	clients    map[*Client]bool
-	broadcast chan *Message
+	broadcast  chan *Message
 	register   chan *Client
 	unregister chan *Client
 	db         *Database
@@ -51,22 +82,127 @@ type Client struct {
 	hub      *Hub
 	conn     *websocket.Conn
 	send     chan *Message
+	userID   int64
 	username string
 }
 
-var hub *Hub
-var db *Database
-
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
+// Config — настройки сервера из переменных окружения (флаги — как резерв).
+type Config struct {
+	Port      string
+	DBPath    string
+	UploadDir string
+	StaticDir string
+	Origins   []string
+	MaxUpload int64
+	StartTime time.Time
 }
 
-// Database methods
-func NewDatabase(dbPath string) (*Database, error) {
-	sqlDB, err := sql.Open("sqlite3", dbPath)
+var (
+	hub      *Hub
+	db       *Database
+	config   Config
+	upgrader websocket.Upgrader
+	version  = "dev"
+)
+
+func getenv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func buildConfig() Config {
+	port := flag.String("port", getenv("GOR_PORT", "8080"), "HTTP/WebSocket port")
+	flag.Parse()
+
+	staticDir := getenv("GOR_STATIC", "./frontend/build")
+	if _, err := os.Stat(staticDir); err != nil {
+		if _, err2 := os.Stat("./build"); err2 == nil {
+			staticDir = "./build"
+		}
+	}
+
+	var origins []string
+	if raw := strings.TrimSpace(os.Getenv("GOR_ORIGINS")); raw != "" {
+		for _, o := range strings.Split(raw, ",") {
+			if o = strings.TrimSpace(o); o != "" {
+				origins = append(origins, o)
+			}
+		}
+	}
+
+	return Config{
+		Port:      *port,
+		DBPath:    getenv("GOR_DB", "./chat.db"),
+		UploadDir: getenv("GOR_UPLOADS", "./uploads"),
+		StaticDir: staticDir,
+		Origins:   origins,
+		MaxUpload: 50 * 1024 * 1024,
+		StartTime: time.Now(),
+	}
+}
+
+// isAllowedOrigin разрешает свой origin, адреса из GOR_ORIGINS и desktop-клиент
+// (Tauri). Не-браузерные клиенты не присылают Origin — им разрешено.
+func isAllowedOrigin(origin, host string) bool {
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
 	if err != nil {
+		return false
+	}
+	// Tauri 2: tauri://localhost (Linux/macOS) и http(s)://tauri.localhost (Windows)
+	if u.Scheme == "tauri" && u.Host == "localhost" {
+		return true
+	}
+	if (u.Scheme == "http" || u.Scheme == "https") && u.Host == "tauri.localhost" {
+		return true
+	}
+	if u.Host == host {
+		return true
+	}
+	for _, allowed := range config.Origins {
+		if origin == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func checkOrigin(r *http.Request) bool {
+	return isAllowedOrigin(r.Header.Get("Origin"), r.Host)
+}
+
+// cors добавляет заголовки для desktop-клиента (Tauri) и внешних origin
+// из GOR_ORIGINS. Для обычного браузера на том же домене ничего не меняется.
+func cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" && isAllowedOrigin(origin, r.Host) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Set("Access-Control-Max-Age", "600")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ---------- Database ----------
+
+func NewDatabase(dbPath string) (*Database, error) {
+	sqlDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := sqlDB.Exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`); err != nil {
 		return nil, err
 	}
 
@@ -97,13 +233,50 @@ func (d *Database) init() error {
 		file_type TEXT
 	);
 	`
-	_, err := d.db.Exec(schema)
-	if err != nil {
+	if _, err := d.db.Exec(schema); err != nil {
 		return err
 	}
+
+	authSchema := `
+	CREATE TABLE IF NOT EXISTS users (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+		password_hash TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS sessions (
+		token TEXT PRIMARY KEY,
+		user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		expires_at INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+	CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+	CREATE TABLE IF NOT EXISTS chats (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		type TEXT NOT NULL CHECK(type IN ('direct', 'group')),
+		title TEXT NOT NULL DEFAULT '',
+		created_by INTEGER,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS chat_members (
+		chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+		user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		last_read_message_id INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (chat_id, user_id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_chat_members_user ON chat_members(user_id);
+	`
+	if _, err := d.db.Exec(authSchema); err != nil {
+		return err
+	}
+
 	return d.ensureColumns()
 }
 
+// ensureColumns добавляет недостающие колонки в старые базы.
 func (d *Database) ensureColumns() error {
 	rows, err := d.db.Query(`PRAGMA table_info(messages)`)
 	if err != nil {
@@ -123,25 +296,64 @@ func (d *Database) ensureColumns() error {
 		}
 		existing[name] = true
 	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
 
-	columns := []string{"message_type", "sticker_id", "sticker_url", "sticker_pack"}
-	for _, col := range columns {
+	columns := map[string]string{
+		"message_type": "TEXT",
+		"sticker_id":   "TEXT",
+		"sticker_url":  "TEXT",
+		"sticker_pack": "TEXT",
+		"file_url":     "TEXT",
+		"file_name":    "TEXT",
+		"file_size":    "INTEGER",
+		"file_type":    "TEXT",
+		"chat_id":      "INTEGER",
+		"user_id":      "INTEGER",
+	}
+	for col, typ := range columns {
 		if !existing[col] {
-			if _, err := d.db.Exec(fmt.Sprintf("ALTER TABLE messages ADD COLUMN %s TEXT", col)); err != nil {
+			if _, err := d.db.Exec(fmt.Sprintf("ALTER TABLE messages ADD COLUMN %s %s", col, typ)); err != nil {
 				return err
 			}
 		}
 	}
 
+	if _, err := d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id)`); err != nil {
+		return err
+	}
+
+	// Общий чат существует всегда: в него попадают старые сообщения и все пользователи.
+	if _, err := d.db.Exec(`INSERT INTO chats (id, type, title)
+		SELECT 1, 'group', 'Общий чат'
+		WHERE NOT EXISTS (SELECT 1 FROM chats WHERE id = 1)`); err != nil {
+		return err
+	}
+	if _, err := d.db.Exec(`UPDATE messages SET chat_id = 1 WHERE chat_id IS NULL`); err != nil {
+		return err
+	}
+	if _, err := d.db.Exec(`UPDATE messages SET user_id = (
+		SELECT id FROM users WHERE users.username = messages.username
+	) WHERE user_id IS NULL`); err != nil {
+		return err
+	}
+	if _, err := d.db.Exec(`INSERT OR IGNORE INTO chat_members (chat_id, user_id) SELECT 1, id FROM users`); err != nil {
+		return err
+	}
 	return nil
 }
 
 func (d *Database) SaveMessage(msg *Message) error {
+	if msg.ChatID == 0 {
+		msg.ChatID = 1
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	query := `INSERT INTO messages (username, text, timestamp, message_type, sticker_id, sticker_url, sticker_pack, file_url, file_name, file_size, file_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	result, err := d.db.Exec(query, msg.Username, msg.Text, msg.Timestamp, msg.Type, msg.StickerID, msg.StickerURL, msg.StickerPack, msg.FileURL, msg.FileName, msg.FileSize, msg.FileType)
+	query := `INSERT INTO messages (chat_id, user_id, username, text, timestamp, message_type, sticker_id, sticker_url, sticker_pack, file_url, file_name, file_size, file_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	result, err := d.db.Exec(query, msg.ChatID, msg.UserID, msg.Username, msg.Text, msg.Timestamp, msg.Type, msg.StickerID, msg.StickerURL, msg.StickerPack, msg.FileURL, msg.FileName, msg.FileSize, msg.FileType)
 	if err != nil {
 		return err
 	}
@@ -150,12 +362,16 @@ func (d *Database) SaveMessage(msg *Message) error {
 	return nil
 }
 
-func (d *Database) GetRecentMessages(limit int) ([]Message, error) {
+func (d *Database) GetMessages(chatID int64, limit int) ([]Message, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	query := `SELECT id, username, text, timestamp, COALESCE(message_type, ''), COALESCE(sticker_id, ''), COALESCE(sticker_url, ''), COALESCE(sticker_pack, ''), COALESCE(file_url, ''), COALESCE(file_name, ''), COALESCE(file_size, 0), COALESCE(file_type, '') FROM messages ORDER BY id DESC LIMIT ?`
-	rows, err := d.db.Query(query, limit)
+	query := `SELECT id, COALESCE(chat_id, 1), COALESCE(user_id, 0), username, text, timestamp,
+		COALESCE(message_type, ''), COALESCE(sticker_id, ''), COALESCE(sticker_url, ''),
+		COALESCE(sticker_pack, ''), COALESCE(file_url, ''), COALESCE(file_name, ''),
+		COALESCE(file_size, 0), COALESCE(file_type, '')
+		FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?`
+	rows, err := d.db.Query(query, chatID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -164,13 +380,18 @@ func (d *Database) GetRecentMessages(limit int) ([]Message, error) {
 	var messages []Message
 	for rows.Next() {
 		var msg Message
-		if err := rows.Scan(&msg.ID, &msg.Username, &msg.Text, &msg.Timestamp, &msg.Type, &msg.StickerID, &msg.StickerURL, &msg.StickerPack, &msg.FileURL, &msg.FileName, &msg.FileSize, &msg.FileType); err != nil {
+		if err := rows.Scan(&msg.ID, &msg.ChatID, &msg.UserID, &msg.Username, &msg.Text, &msg.Timestamp,
+			&msg.Type, &msg.StickerID, &msg.StickerURL, &msg.StickerPack,
+			&msg.FileURL, &msg.FileName, &msg.FileSize, &msg.FileType); err != nil {
 			return nil, err
 		}
 		messages = append(messages, msg)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 
-	// Reverse to show oldest first
+	// старые сначала
 	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
 		messages[i], messages[j] = messages[j], messages[i]
 	}
@@ -178,11 +399,394 @@ func (d *Database) GetRecentMessages(limit int) ([]Message, error) {
 	return messages, nil
 }
 
+// ---------- Chats ----------
+
+// EnsureGeneralChat добавляет пользователя в общий чат (идемпотентно).
+func (d *Database) EnsureGeneralChat(userID int64) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, err := d.db.Exec(`INSERT OR IGNORE INTO chat_members (chat_id, user_id) VALUES (1, ?)`, userID)
+	return err
+}
+
+func (d *Database) IsMember(chatID, userID int64) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var one int
+	err := d.db.QueryRow(`SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?`, chatID, userID).Scan(&one)
+	return err == nil
+}
+
+func (d *Database) FindUser(username string) (*User, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var user User
+	err := d.db.QueryRow(`SELECT id, username FROM users WHERE username = ?`, username).Scan(&user.ID, &user.Username)
+	if err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
+func (d *Database) SearchUsers(query string, excludeID int64, limit int) ([]User, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 20
+	}
+	pattern := "%" + strings.TrimSpace(query) + "%"
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	rows, err := d.db.Query(`SELECT id, username FROM users WHERE id != ? AND username LIKE ? ORDER BY username LIMIT ?`,
+		excludeID, pattern, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []User
+	for rows.Next() {
+		var user User
+		if err := rows.Scan(&user.ID, &user.Username); err != nil {
+			return nil, err
+		}
+		users = append(users, user)
+	}
+	return users, rows.Err()
+}
+
+func (d *Database) ChatMembers(chatID int64) ([]User, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	rows, err := d.db.Query(`SELECT u.id, u.username FROM chat_members cm
+		JOIN users u ON u.id = cm.user_id WHERE cm.chat_id = ? ORDER BY u.username`, chatID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []User
+	for rows.Next() {
+		var user User
+		if err := rows.Scan(&user.ID, &user.Username); err != nil {
+			return nil, err
+		}
+		users = append(users, user)
+	}
+	return users, rows.Err()
+}
+
+// FindDirectChat ищет существующий личный чат двух пользователей.
+func (d *Database) FindDirectChat(a, b int64) (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	var chatID int64
+	err := d.db.QueryRow(`
+		SELECT cm1.chat_id FROM chat_members cm1
+		JOIN chat_members cm2 ON cm2.chat_id = cm1.chat_id
+		JOIN chats c ON c.id = cm1.chat_id
+		WHERE c.type = 'direct' AND cm1.user_id = ? AND cm2.user_id = ?
+		LIMIT 1`, a, b).Scan(&chatID)
+	return chatID, err
+}
+
+func (d *Database) CreateDirectChat(a, b int64) (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.Exec(`INSERT INTO chats (type, title, created_by) VALUES ('direct', '', ?)`, a)
+	if err != nil {
+		return 0, err
+	}
+	chatID, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(`INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?), (?, ?)`, chatID, a, chatID, b); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return chatID, nil
+}
+
+func (d *Database) CreateGroupChat(title string, creatorID int64, memberIDs []int64) (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.Exec(`INSERT INTO chats (type, title, created_by) VALUES ('group', ?, ?)`, title, creatorID)
+	if err != nil {
+		return 0, err
+	}
+	chatID, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+
+	seen := map[int64]bool{creatorID: true}
+	if _, err := tx.Exec(`INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)`, chatID, creatorID); err != nil {
+		return 0, err
+	}
+	for _, id := range memberIDs {
+		if id == 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		if _, err := tx.Exec(`INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)`, chatID, id); err != nil {
+			return 0, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return chatID, nil
+}
+
+func (d *Database) MarkRead(chatID, userID, messageID int64) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, err := d.db.Exec(`UPDATE chat_members
+		SET last_read_message_id = MAX(last_read_message_id, ?)
+		WHERE chat_id = ? AND user_id = ?`, messageID, chatID, userID)
+	return err
+}
+
+// ListChats возвращает чаты пользователя с последним сообщением и числом непрочитанных.
+func (d *Database) ListChats(userID int64) ([]Chat, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	rows, err := d.db.Query(`SELECT c.id, c.type, c.title, cm.last_read_message_id
+		FROM chats c JOIN chat_members cm ON cm.chat_id = c.id
+		WHERE cm.user_id = ?`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type rowData struct {
+		chat   Chat
+		lastID int64
+	}
+	var items []rowData
+
+	for rows.Next() {
+		var item rowData
+		var lastRead int64
+		if err := rows.Scan(&item.chat.ID, &item.chat.Type, &item.chat.Title, &lastRead); err != nil {
+			return nil, err
+		}
+
+		// последнее сообщение
+		var text, sender, ts sql.NullString
+		var lastID sql.NullInt64
+		err := d.db.QueryRow(`SELECT id, text, username, timestamp FROM messages
+			WHERE chat_id = ? ORDER BY id DESC LIMIT 1`, item.chat.ID).
+			Scan(&lastID, &text, &sender, &ts)
+		if err == nil {
+			item.lastID = lastID.Int64
+			item.chat.LastText = text.String
+			item.chat.LastSender = sender.String
+			item.chat.LastTime = ts.String
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+
+		// непрочитанные
+		if err := d.db.QueryRow(`SELECT COUNT(*) FROM messages
+			WHERE chat_id = ? AND id > ? AND COALESCE(user_id, 0) != ?`,
+			item.chat.ID, lastRead, userID).Scan(&item.chat.Unread); err != nil {
+			return nil, err
+		}
+
+		// для личного чата показываем собеседника
+		if item.chat.Type == "direct" {
+			err := d.db.QueryRow(`SELECT u.id, u.username FROM chat_members cm
+				JOIN users u ON u.id = cm.user_id
+				WHERE cm.chat_id = ? AND cm.user_id != ? LIMIT 1`, item.chat.ID, userID).
+				Scan(&item.chat.PeerID, &item.chat.Peer)
+			if err == nil {
+				item.chat.Title = item.chat.Peer
+			}
+		}
+
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// новые сверху
+	for i := 0; i < len(items); i++ {
+		for j := i + 1; j < len(items); j++ {
+			if items[j].lastID > items[i].lastID {
+				items[i], items[j] = items[j], items[i]
+			}
+		}
+	}
+
+	chats := make([]Chat, 0, len(items))
+	for _, item := range items {
+		chats = append(chats, item.chat)
+	}
+	return chats, nil
+}
+
 func (d *Database) Close() error {
 	return d.db.Close()
 }
 
-// Hub constructor
+// ---------- Auth ----------
+
+const (
+	argonMemory  = 19456 // 19 MiB
+	argonTime    = 2
+	argonThreads = 1
+	argonKeyLen  = 32
+	sessionTTL   = 30 * 24 * time.Hour
+)
+
+func hashPassword(password string) (string, error) {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	hash := argon2.IDKey([]byte(password), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
+	return fmt.Sprintf("argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
+		argon2.Version, argonMemory, argonTime, argonThreads,
+		base64.RawStdEncoding.EncodeToString(salt),
+		base64.RawStdEncoding.EncodeToString(hash)), nil
+}
+
+func verifyPassword(encoded, password string) bool {
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 5 || parts[0] != "argon2id" {
+		return false
+	}
+	var memory, iterations uint32
+	var threads uint8
+	if _, err := fmt.Sscanf(parts[2], "m=%d,t=%d,p=%d", &memory, &iterations, &threads); err != nil {
+		return false
+	}
+	salt, err := base64.RawStdEncoding.DecodeString(parts[3])
+	if err != nil {
+		return false
+	}
+	expected, err := base64.RawStdEncoding.DecodeString(parts[4])
+	if err != nil {
+		return false
+	}
+	actual := argon2.IDKey([]byte(password), salt, iterations, memory, threads, uint32(len(expected)))
+	return subtle.ConstantTimeCompare(actual, expected) == 1
+}
+
+func (d *Database) CreateUser(username, password string) (*User, error) {
+	hash, err := hashPassword(password)
+	if err != nil {
+		return nil, err
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	result, err := d.db.Exec(`INSERT INTO users (username, password_hash) VALUES (?, ?)`, username, hash)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := result.LastInsertId()
+	return &User{ID: id, Username: username}, nil
+}
+
+func (d *Database) Authenticate(username, password string) (*User, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	var user User
+	var hash string
+	err := d.db.QueryRow(`SELECT id, username, password_hash FROM users WHERE username = ?`, username).
+		Scan(&user.ID, &user.Username, &hash)
+	if err != nil {
+		return nil, err
+	}
+	if !verifyPassword(hash, password) {
+		return nil, errors.New("invalid credentials")
+	}
+	return &user, nil
+}
+
+func (d *Database) CreateSession(userID int64) (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	token := base64.RawURLEncoding.EncodeToString(raw)
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	expires := time.Now().Add(sessionTTL).Unix()
+	_, err := d.db.Exec(`INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)`,
+		token, userID, expires)
+	if err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func (d *Database) UserByToken(token string) (*User, error) {
+	if token == "" {
+		return nil, errors.New("empty token")
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	var user User
+	err := d.db.QueryRow(`
+		SELECT u.id, u.username
+		FROM sessions s
+		JOIN users u ON u.id = s.user_id
+		WHERE s.token = ? AND s.expires_at > ?`,
+		token, time.Now().Unix()).Scan(&user.ID, &user.Username)
+	if err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
+func (d *Database) DeleteSession(token string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, err := d.db.Exec(`DELETE FROM sessions WHERE token = ?`, token)
+	return err
+}
+
+func (d *Database) CleanupSessions() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, err := d.db.Exec(`DELETE FROM sessions WHERE expires_at <= ?`, time.Now().Unix()); err != nil {
+		log.Printf("session cleanup: %v", err)
+	}
+}
+
+// ---------- Hub ----------
+
 func newHub() *Hub {
 	return &Hub{
 		broadcast:  make(chan *Message, 256),
@@ -190,6 +794,25 @@ func newHub() *Hub {
 		unregister: make(chan *Client),
 		clients:    make(map[*Client]bool),
 		db:         db,
+	}
+}
+
+func (h *Hub) removeClient(client *Client) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.clients[client]; ok {
+		delete(h.clients, client)
+		close(client.send)
+	}
+}
+
+func (h *Hub) stop() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for client := range h.clients {
+		close(client.send)
+		client.conn.Close()
+		delete(h.clients, client)
 	}
 }
 
@@ -204,50 +827,32 @@ func (h *Hub) run() {
 
 			log.Printf("[%s] подключился. Online: %d\n", client.username, clientCount)
 
-			// Load chat history
-			history, err := h.db.GetRecentMessages(50)
-			if err != nil {
-				log.Printf("Failed to load history: %v\n", err)
-			} else if len(history) > 0 {
-				// Send history to new client
-				for _, msg := range history {
-					select {
-					case client.send <- &msg:
-					default:
-						log.Println("History send failed - client buffer full")
-					}
-				}
-			}
-
-			// Notify others
-			systemMsg := &Message{
+			h.broadcast <- &Message{
+				ChatID:    1,
 				Username:  "System",
 				Text:      fmt.Sprintf("[%s] присоединился к чату", client.username),
 				Timestamp: time.Now().Format("15:04:05"),
 			}
-			h.broadcast <- systemMsg
 
 		case client := <-h.unregister:
-			h.mu.Lock()
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-				close(client.send)
-				h.mu.Unlock()
+			h.mu.RLock()
+			_, ok := h.clients[client]
+			h.mu.RUnlock()
+			if ok {
+				h.removeClient(client)
 				log.Printf("[%s] отключился\n", client.username)
-
-				// Notify others
-				systemMsg := &Message{
+				h.broadcast <- &Message{
+					ChatID:    1,
 					Username:  "System",
 					Text:      fmt.Sprintf("[%s] покинул чат", client.username),
 					Timestamp: time.Now().Format("15:04:05"),
 				}
-				h.broadcast <- systemMsg
-			} else {
-				h.mu.Unlock()
 			}
 
 		case message := <-h.broadcast:
-			// Save message to database if it's not a system message
+			if message.ChatID == 0 {
+				message.ChatID = 1
+			}
 			if message.Username != "System" {
 				if message.Timestamp == "" {
 					message.Timestamp = time.Now().Format("15:04:05")
@@ -257,20 +862,36 @@ func (h *Hub) run() {
 				}
 			}
 
-			// Broadcast to all clients
+			var dead []*Client
 			h.mu.RLock()
 			for client := range h.clients {
+				// сообщение уходит только участникам чата
+				if !h.db.IsMember(message.ChatID, client.userID) {
+					continue
+				}
 				select {
 				case client.send <- message:
 				default:
-					close(client.send)
-					delete(h.clients, client)
+					dead = append(dead, client)
 				}
 			}
 			h.mu.RUnlock()
+			for _, client := range dead {
+				h.removeClient(client)
+				client.conn.Close()
+			}
 		}
 	}
 }
+
+// ---------- Websocket ----------
+
+const (
+	writeWait      = 10 * time.Second
+	pongWait       = 60 * time.Second
+	pingPeriod     = (pongWait * 9) / 10
+	maxMessageSize = 1 << 20 // 1 MiB
+)
 
 func (c *Client) readPump() {
 	defer func() {
@@ -278,7 +899,10 @@ func (c *Client) readPump() {
 		c.conn.Close()
 	}()
 
+	c.conn.SetReadLimit(maxMessageSize)
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
 		return nil
 	})
 
@@ -291,6 +915,11 @@ func (c *Client) readPump() {
 			}
 			return
 		}
+		if msg.ChatID == 0 || !c.hub.db.IsMember(msg.ChatID, c.userID) {
+			log.Printf("[%s] попытка писать в чужой чат %d", c.username, msg.ChatID)
+			continue
+		}
+		msg.UserID = c.userID
 		msg.Username = c.username
 		msg.Timestamp = time.Now().Format("15:04:05")
 		c.hub.broadcast <- &msg
@@ -298,22 +927,36 @@ func (c *Client) readPump() {
 }
 
 func (c *Client) writePump() {
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
+
 	for {
-		msg, ok := <-c.send
-		if !ok {
-			return
-		}
-		err := c.conn.WriteJSON(msg)
-		if err != nil {
-			return
+		select {
+		case msg, ok := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			if err := c.conn.WriteJSON(msg); err != nil {
+				return
+			}
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
 		}
 	}
 }
 
 func handleWS(w http.ResponseWriter, r *http.Request) {
-	username := r.URL.Query().Get("username")
-	if username == "" {
-		username = "Anonymous"
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -326,7 +969,8 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		hub:      hub,
 		conn:     conn,
 		send:     make(chan *Message, 256),
-		username: username,
+		userID:   user.ID,
+		username: user.Username,
 	}
 
 	hub.register <- client
@@ -335,19 +979,458 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 	go client.readPump()
 }
 
+// ---------- Auth HTTP ----------
+
+var (
+	usernameRe = regexp.MustCompile(`^[a-zA-Z0-9_.-]{3,32}$`)
+	dummyHash  = func() string {
+		h, _ := hashPassword("gor-dummy-password-for-timing")
+		return h
+	}()
+	authLimiter = newRateLimiter(20, 5*time.Minute)
+)
+
+type credentials struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type authResponse struct {
+	Token string `json:"token"`
+	User  *User  `json:"user"`
+}
+
+type rateLimiter struct {
+	mu       sync.Mutex
+	attempts map[string][]time.Time
+	limit    int
+	window   time.Duration
+}
+
+func newRateLimiter(limit int, window time.Duration) *rateLimiter {
+	return &rateLimiter{
+		attempts: make(map[string][]time.Time),
+		limit:    limit,
+		window:   window,
+	}
+}
+
+func (l *rateLimiter) Allow(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := time.Now()
+	recent := l.attempts[key][:0]
+	for _, t := range l.attempts[key] {
+		if now.Sub(t) < l.window {
+			recent = append(recent, t)
+		}
+	}
+	if len(recent) >= l.limit {
+		l.attempts[key] = recent
+		return false
+	}
+	l.attempts[key] = append(recent, now)
+	return true
+}
+
+func clientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		return strings.TrimSpace(strings.Split(forwarded, ",")[0])
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+func tokenFromRequest(r *http.Request) string {
+	if header := r.Header.Get("Authorization"); strings.HasPrefix(header, "Bearer ") {
+		return strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
+	}
+	// Браузерный WebSocket не умеет заголовки — токен передаётся в query.
+	if token := r.URL.Query().Get("token"); token != "" {
+		return token
+	}
+	if cookie, err := r.Cookie("gor_session"); err == nil {
+		return cookie.Value
+	}
+	return ""
+}
+
+func authenticate(r *http.Request) (*User, error) {
+	return db.UserByToken(tokenFromRequest(r))
+}
+
+func requireUser(w http.ResponseWriter, r *http.Request) (*User, bool) {
+	user, err := authenticate(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return nil, false
+	}
+	return user, true
+}
+
+func writeJSON(w http.ResponseWriter, status int, value interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(value)
+}
+
+func handleRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !authLimiter.Allow(clientIP(r)) {
+		http.Error(w, "Слишком много попыток, попробуйте позже", http.StatusTooManyRequests)
+		return
+	}
+
+	var creds credentials
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&creds); err != nil {
+		http.Error(w, "Некорректный запрос", http.StatusBadRequest)
+		return
+	}
+	creds.Username = strings.TrimSpace(creds.Username)
+
+	if !usernameRe.MatchString(creds.Username) {
+		http.Error(w, "Имя: 3-32 символа, латиница, цифры, _ . -", http.StatusBadRequest)
+		return
+	}
+	if len(creds.Password) < 8 {
+		http.Error(w, "Пароль должен быть не короче 8 символов", http.StatusBadRequest)
+		return
+	}
+	if len(creds.Password) > 256 {
+		http.Error(w, "Пароль слишком длинный", http.StatusBadRequest)
+		return
+	}
+
+	user, err := db.CreateUser(creds.Username, creds.Password)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			http.Error(w, "Это имя уже занято", http.StatusConflict)
+			return
+		}
+		log.Printf("register: %v", err)
+		http.Error(w, "Не удалось создать аккаунт", http.StatusInternalServerError)
+		return
+	}
+
+	token, err := db.CreateSession(user.ID)
+	if err != nil {
+		log.Printf("create session: %v", err)
+		http.Error(w, "Не удалось создать сессию", http.StatusInternalServerError)
+		return
+	}
+
+	db.EnsureGeneralChat(user.ID)
+
+	log.Printf("Новый аккаунт: %s", user.Username)
+	writeJSON(w, http.StatusCreated, authResponse{Token: token, User: user})
+}
+
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !authLimiter.Allow(clientIP(r)) {
+		http.Error(w, "Слишком много попыток, попробуйте позже", http.StatusTooManyRequests)
+		return
+	}
+
+	var creds credentials
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&creds); err != nil {
+		http.Error(w, "Некорректный запрос", http.StatusBadRequest)
+		return
+	}
+	creds.Username = strings.TrimSpace(creds.Username)
+
+	user, err := db.Authenticate(creds.Username, creds.Password)
+	if err != nil {
+		// Выравниваем время ответа, чтобы нельзя было перебрать имена.
+		if errors.Is(err, sql.ErrNoRows) {
+			verifyPassword(dummyHash, creds.Password)
+		}
+		http.Error(w, "Неверное имя или пароль", http.StatusUnauthorized)
+		return
+	}
+
+	db.EnsureGeneralChat(user.ID)
+
+	token, err := db.CreateSession(user.ID)
+	if err != nil {
+		log.Printf("create session: %v", err)
+		http.Error(w, "Не удалось создать сессию", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, authResponse{Token: token, User: user})
+}
+
+func handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if token := tokenFromRequest(r); token != "" {
+		db.DeleteSession(token)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func handleMe(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"user": user})
+}
+
+// ---------- HTTP ----------
+
 func handleStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	hub.mu.RLock()
 	count := len(hub.clients)
 	hub.mu.RUnlock()
-	json.NewEncoder(w).Encode(map[string]int{
-		"online": count,
+	json.NewEncoder(w).Encode(map[string]int{"online": count})
+}
+
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	status := "ok"
+	if err := db.db.Ping(); err != nil {
+		status = "degraded"
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  status,
+		"uptime":  time.Since(config.StartTime).Round(time.Second).String(),
+		"version": version,
 	})
 }
 
+func handleUsers(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	users, err := db.SearchUsers(r.URL.Query().Get("q"), user.ID, 20)
+	if err != nil {
+		log.Printf("search users: %v", err)
+		http.Error(w, "Не удалось найти пользователей", http.StatusInternalServerError)
+		return
+	}
+	if users == nil {
+		users = []User{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"users": users})
+}
+
+type createChatRequest struct {
+	Type      string   `json:"type"`
+	Username  string   `json:"username"`
+	Title     string   `json:"title"`
+	Usernames []string `json:"usernames"`
+}
+
+func chatByID(userID, chatID int64) (*Chat, error) {
+	chats, err := db.ListChats(userID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range chats {
+		if chats[i].ID == chatID {
+			return &chats[i], nil
+		}
+	}
+	return nil, sql.ErrNoRows
+}
+
+func handleChats(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		chats, err := db.ListChats(user.ID)
+		if err != nil {
+			log.Printf("list chats: %v", err)
+			http.Error(w, "Не удалось загрузить чаты", http.StatusInternalServerError)
+			return
+		}
+		if chats == nil {
+			chats = []Chat{}
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"chats": chats})
+
+	case http.MethodPost:
+		var req createChatRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req); err != nil {
+			http.Error(w, "Некорректный запрос", http.StatusBadRequest)
+			return
+		}
+
+		switch req.Type {
+		case "direct":
+			peer, err := db.FindUser(strings.TrimSpace(req.Username))
+			if err != nil {
+				http.Error(w, "Пользователь не найден", http.StatusNotFound)
+				return
+			}
+			if peer.ID == user.ID {
+				http.Error(w, "Нельзя начать чат с самим собой", http.StatusBadRequest)
+				return
+			}
+
+			chatID, err := db.FindDirectChat(user.ID, peer.ID)
+			if errors.Is(err, sql.ErrNoRows) {
+				chatID, err = db.CreateDirectChat(user.ID, peer.ID)
+			}
+			if err != nil {
+				log.Printf("create direct chat: %v", err)
+				http.Error(w, "Не удалось создать чат", http.StatusInternalServerError)
+				return
+			}
+
+			chat, err := chatByID(user.ID, chatID)
+			if err != nil {
+				http.Error(w, "Чат создан, но не найден", http.StatusInternalServerError)
+				return
+			}
+			writeJSON(w, http.StatusCreated, map[string]interface{}{"chat": chat})
+
+		case "group":
+			title := strings.TrimSpace(req.Title)
+			if len([]rune(title)) < 1 || len([]rune(title)) > 64 {
+				http.Error(w, "Название группы: от 1 до 64 символов", http.StatusBadRequest)
+				return
+			}
+			if len(req.Usernames) == 0 {
+				http.Error(w, "Добавьте хотя бы одного участника", http.StatusBadRequest)
+				return
+			}
+			if len(req.Usernames) > 50 {
+				http.Error(w, "Слишком много участников (максимум 50)", http.StatusBadRequest)
+				return
+			}
+
+			var memberIDs []int64
+			for _, name := range req.Usernames {
+				member, err := db.FindUser(strings.TrimSpace(name))
+				if err != nil {
+					http.Error(w, fmt.Sprintf("Пользователь %q не найден", name), http.StatusNotFound)
+					return
+				}
+				memberIDs = append(memberIDs, member.ID)
+			}
+
+			chatID, err := db.CreateGroupChat(title, user.ID, memberIDs)
+			if err != nil {
+				log.Printf("create group: %v", err)
+				http.Error(w, "Не удалось создать группу", http.StatusInternalServerError)
+				return
+			}
+			chat, err := chatByID(user.ID, chatID)
+			if err != nil {
+				http.Error(w, "Группа создана, но не найдена", http.StatusInternalServerError)
+				return
+			}
+			writeJSON(w, http.StatusCreated, map[string]interface{}{"chat": chat})
+
+		default:
+			http.Error(w, "Тип чата: direct или group", http.StatusBadRequest)
+		}
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleChatSubroutes обслуживает /api/chats/{id}/messages и /api/chats/{id}/read.
+func handleChatSubroutes(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
+
+	rest := strings.TrimPrefix(r.URL.Path, "/api/chats/")
+	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	if len(parts) != 2 {
+		http.NotFound(w, r)
+		return
+	}
+
+	chatID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || chatID <= 0 {
+		http.NotFound(w, r)
+		return
+	}
+	if !db.IsMember(chatID, user.ID) {
+		http.Error(w, "Нет доступа к чату", http.StatusForbidden)
+		return
+	}
+
+	switch {
+	case parts[1] == "messages" && r.Method == http.MethodGet:
+		messages, err := db.GetMessages(chatID, 100)
+		if err != nil {
+			log.Printf("get chat messages: %v", err)
+			http.Error(w, "Не удалось загрузить сообщения", http.StatusInternalServerError)
+			return
+		}
+		if messages == nil {
+			messages = []Message{}
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"messages": messages})
+
+	case parts[1] == "read" && r.Method == http.MethodPost:
+		var body struct {
+			MessageID int64 `json:"messageId"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&body); err != nil {
+			http.Error(w, "Некорректный запрос", http.StatusBadRequest)
+			return
+		}
+		if err := db.MarkRead(chatID, user.ID, body.MessageID); err != nil {
+			log.Printf("mark read: %v", err)
+			http.Error(w, "Не удалось отметить прочитанным", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+
+	default:
+		http.NotFound(w, r)
+	}
+}
+
 func handleMessages(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
+
+	chatID, _ := strconv.ParseInt(r.URL.Query().Get("chatId"), 10, 64)
+	if chatID == 0 {
+		chatID = 1
+	}
+	if !db.IsMember(chatID, user.ID) {
+		http.Error(w, "Нет доступа к чату", http.StatusForbidden)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	messages, err := db.GetRecentMessages(100)
+	messages, err := db.GetMessages(chatID, 100)
 	if err != nil {
 		http.Error(w, "Failed to get messages", http.StatusInternalServerError)
 		return
@@ -355,11 +1438,8 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(messages)
 }
 
-// getFileType determines file type based on extension
 func getFileType(filename string) string {
-	ext := strings.ToLower(filepath.Ext(filename))
-
-	switch ext {
+	switch strings.ToLower(filepath.Ext(filename)) {
 	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg":
 		return "image"
 	case ".mp3", ".wav", ".ogg", ".flac", ".aac":
@@ -371,21 +1451,43 @@ func getFileType(filename string) string {
 	}
 }
 
+// safeUploadName делает имя файла безопасным (без путей и управляющих символов).
+func safeUploadName(name string) string {
+	name = filepath.Base(strings.ReplaceAll(name, "\\", "/"))
+	name = strings.Map(func(r rune) rune {
+		if r < 32 || r == '/' || r == '\\' {
+			return -1
+		}
+		return r
+	}, name)
+	if name == "" || name == "." || name == ".." {
+		name = "file"
+	}
+	if len(name) > 128 {
+		ext := filepath.Ext(name)
+		name = name[:120] + ext
+	}
+	return name
+}
+
 func handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Create uploads directory if it doesn't exist
-	if err := os.MkdirAll("./uploads", 0755); err != nil {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
+
+	if err := os.MkdirAll(config.UploadDir, 0755); err != nil {
 		http.Error(w, "Failed to create uploads directory", http.StatusInternalServerError)
 		return
 	}
 
-	// Parse form with max 50MB
-	maxSize := int64(50 * 1024 * 1024) // 50MB
-	if err := r.ParseMultipartForm(maxSize); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, config.MaxUpload+1024*1024)
+	if err := r.ParseMultipartForm(config.MaxUpload); err != nil {
 		http.Error(w, "File too large (max 50MB)", http.StatusBadRequest)
 		return
 	}
@@ -397,22 +1499,25 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// Check file size
-	if fileHeader.Size > maxSize {
+	if fileHeader.Size > config.MaxUpload {
 		http.Error(w, "File too large (max 50MB)", http.StatusBadRequest)
 		return
 	}
 
-	username := r.FormValue("username")
-	if username == "" {
-		username = "Anonymous"
+	username := user.Username
+
+	chatID, _ := strconv.ParseInt(r.FormValue("chatId"), 10, 64)
+	if chatID == 0 {
+		chatID = 1
+	}
+	if !db.IsMember(chatID, user.ID) {
+		http.Error(w, "Нет доступа к чату", http.StatusForbidden)
+		return
 	}
 
-	// Generate unique filename
-	timestamp := time.Now().Unix()
-	filename := filepath.Join("./uploads", fmt.Sprintf("%d_%s", timestamp, fileHeader.Filename))
+	originalName := safeUploadName(fileHeader.Filename)
+	filename := filepath.Join(config.UploadDir, fmt.Sprintf("%d_%s", time.Now().UnixNano(), originalName))
 
-	// Create destination file
 	dst, err := os.Create(filename)
 	if err != nil {
 		http.Error(w, "Failed to save file", http.StatusInternalServerError)
@@ -420,34 +1525,27 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer dst.Close()
 
-	// Copy file
 	size, err := io.Copy(dst, file)
 	if err != nil {
+		os.Remove(filename)
 		http.Error(w, "Failed to copy file", http.StatusInternalServerError)
 		return
 	}
 
-	// Determine file type
-	fileType := getFileType(fileHeader.Filename)
-
-	// Create message with file info
 	msg := &Message{
-		Username:   username,
-		Text:       "📎 Отправил файл",
-		Type:       "file",
-		Timestamp:  time.Now().Format("15:04:05"),
-		FileURL:    fmt.Sprintf("/uploads/%s", filepath.Base(filename)),
-		FileName:   fileHeader.Filename,
-		FileSize:   size,
-		FileType:   fileType,
+		ChatID:    chatID,
+		UserID:    user.ID,
+		Username:  username,
+		Text:      "📎 Отправил файл",
+		Type:      "file",
+		Timestamp: time.Now().Format("15:04:05"),
+		FileURL:   fmt.Sprintf("/uploads/%s", filepath.Base(filename)),
+		FileName:  originalName,
+		FileSize:  size,
+		FileType:  getFileType(originalName),
 	}
 
-	// Save to database
-	if err := db.SaveMessage(msg); err != nil {
-		log.Printf("Failed to save file message: %v\n", err)
-	}
-
-	// Broadcast to all clients
+	// hub сам сохранит сообщение в БД и разошлёт всем
 	hub.broadcast <- msg
 
 	w.Header().Set("Content-Type", "application/json")
@@ -460,13 +1558,23 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// resolveUploadPath возвращает путь внутри uploads или ошибку.
+func resolveUploadPath(name string) (string, error) {
+	uploadsDir, err := filepath.Abs(config.UploadDir)
+	if err != nil {
+		return "", err
+	}
+	candidate := filepath.Join(uploadsDir, filepath.Base(filepath.Clean("/"+name)))
+	rel, err := filepath.Rel(uploadsDir, candidate)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", errors.New("path outside uploads")
+	}
+	return candidate, nil
+}
+
 func handleDownload(w http.ResponseWriter, r *http.Request) {
-	filePath := filepath.Join("./uploads", r.URL.Query().Get("file"))
-	
-	// Prevent directory traversal
-	absPath, _ := filepath.Abs(filePath)
-	uploadsDir, _ := filepath.Abs("./uploads")
-	if !strings.HasPrefix(absPath, uploadsDir) {
+	filePath, err := resolveUploadPath(r.URL.Query().Get("file"))
+	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
@@ -480,36 +1588,101 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, filePath)
 }
 
-func main() {
-	port := flag.String("port", "8080", "WebSocket server port")
-	flag.Parse()
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/ws" || strings.HasPrefix(r.URL.Path, "/api/stats") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
+	})
+}
 
-	// Initialize database
+func main() {
+	config = buildConfig()
+	upgrader = websocket.Upgrader{
+		CheckOrigin:      checkOrigin,
+		HandshakeTimeout: 10 * time.Second,
+	}
+
 	var err error
-	db, err = NewDatabase("./chat.db")
+	db, err = NewDatabase(config.DBPath)
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v\n", err)
 	}
 	defer db.Close()
 
-	// Create uploads directory
-	os.MkdirAll("./uploads", 0755)
+	if err := os.MkdirAll(config.UploadDir, 0755); err != nil {
+		log.Fatalf("Failed to create uploads directory: %v\n", err)
+	}
 
 	hub = newHub()
 	go hub.run()
 
-	http.HandleFunc("/ws", handleWS)
-	http.HandleFunc("/api/stats", handleStats)
-	http.HandleFunc("/api/messages", handleMessages)
-	http.HandleFunc("/api/upload", handleUpload)
-	http.HandleFunc("/api/download", handleDownload)
-	http.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir("./uploads"))))
-	http.Handle("/", http.FileServer(http.Dir("./frontend/build")))
+	db.CleanupSessions()
+	go func() {
+		ticker := time.NewTicker(6 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			db.CleanupSessions()
+		}
+	}()
 
-	addr := ":" + *port
-	log.Printf("WebSocket server running on ws://localhost%s/ws\n", addr)
-	log.Printf("HTTP server running on http://localhost%s\n", addr)
-	log.Printf("Database: ./chat.db\n")
-	log.Printf("Uploads directory: ./uploads\n")
-	log.Fatal(http.ListenAndServe(addr, nil))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", handleWS)
+	mux.HandleFunc("/api/stats", handleStats)
+	mux.HandleFunc("/api/health", handleHealth)
+	mux.HandleFunc("/api/auth/register", handleRegister)
+	mux.HandleFunc("/api/auth/login", handleLogin)
+	mux.HandleFunc("/api/auth/logout", handleLogout)
+	mux.HandleFunc("/api/auth/me", handleMe)
+	mux.HandleFunc("/api/messages", handleMessages)
+	mux.HandleFunc("/api/users", handleUsers)
+	mux.HandleFunc("/api/chats", handleChats)
+	mux.HandleFunc("/api/chats/", handleChatSubroutes)
+	mux.HandleFunc("/api/upload", handleUpload)
+	mux.HandleFunc("/api/download", handleDownload)
+	mux.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir(config.UploadDir))))
+
+	if _, err := os.Stat(config.StaticDir); err == nil {
+		mux.Handle("/", http.FileServer(http.Dir(config.StaticDir)))
+	} else {
+		log.Printf("ВНИМАНИЕ: каталог фронтенда %q не найден", config.StaticDir)
+		log.Printf("Соберите клиент: cd frontend && npm ci && npm run build")
+	}
+
+	srv := &http.Server{
+		Addr:              ":" + config.Port,
+		Handler:           logRequests(cors(mux)),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	log.Printf("GOR %s запущен", version)
+	log.Printf("WebSocket: ws://localhost:%s/ws", config.Port)
+	log.Printf("HTTP:      http://localhost:%s", config.Port)
+	log.Printf("Database:  %s", config.DBPath)
+	log.Printf("Uploads:   %s", config.UploadDir)
+	log.Printf("Static:    %s", config.StaticDir)
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	<-ctx.Done()
+
+	log.Println("Останавливаюсь, закрываю соединения...")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("ошибка завершения HTTP: %v", err)
+	}
+	hub.stop()
+	log.Println("Готово.")
 }

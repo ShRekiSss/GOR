@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" rx="220" fill="#0d1117"/>
+  <rect x="30" y="30" width="964" height="964" rx="196" fill="none" stroke="#39d353" stroke-width="16" opacity="0.5"/>
+  <text x="512" y="560" text-anchor="middle" font-family="DejaVu Sans" font-weight="bold" font-size="320" letter-spacing="16" fill="#39d353">GOR</text>
+  <text x="512" y="770" text-anchor="middle" font-family="DejaVu Sans Mono" font-size="150" fill="#9aa6bf">&gt;_</text>
+</svg>
