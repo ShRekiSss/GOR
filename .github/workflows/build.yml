@@ -190,4 +190,4 @@ jobs:
             artifacts/gor-desktop-linux/**/*.AppImage
             artifacts/gor-desktop-linux/**/*.deb
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, '-') }}

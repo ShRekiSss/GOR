@@ -1,6 +1,6 @@
 [package]
 name = "gor-desktop"
-version = "0.5.0-beta"
+version = "0.5.0"
 description = "GOR messenger desktop client"
 authors = ["GOR"]
 edition = "2021"
