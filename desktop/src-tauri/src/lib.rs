@@ -19,8 +19,7 @@ pub fn run() {
         .expect("error while running GOR");
 }
 
-#[cfg_attr(not(mobile), tauri::mobile_entry_point)]
-#[cfg(not(mobile))]
+#[cfg(desktop)]
 pub fn run() {
     use tauri::menu::{Menu, MenuItem};
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};

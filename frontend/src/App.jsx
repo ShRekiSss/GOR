@@ -11,6 +11,9 @@ import {
 } from './server';
 import { authFetch, clearToken, getToken, setToken } from './auth';
 
+// Порог мобильной (Android/PWA) раскладки — совпадает с CSS @media.
+const MOBILE_MQ = '(max-width: 820px)';
+
 function App() {
   const [messages, setMessages] = useState([]);
   const [inputValue, setInputValue] = useState('');
@@ -57,6 +60,26 @@ function App() {
   const [chatError, setChatError] = useState('');
   const [autostart, setAutostart] = useState(false);
 
+  // --- Мобильный режим (Android/PWA): жесты в стиле Signal-Android ---
+  const [isMobile, setIsMobile] = useState(() => window.matchMedia(MOBILE_MQ).matches);
+  const [mobileChatOpen, setMobileChatOpen] = useState(false);
+  const [mobileSwipe, setMobileSwipe] = useState(0);
+  const [mobileSwiping, setMobileSwiping] = useState(false);
+  const [pullPx, setPullPx] = useState(0);
+  const [pulling, setPulling] = useState(false);
+  const [contextChat, setContextChat] = useState(null);
+  const [composeOpen, setComposeOpen] = useState(false);
+  const [toast, setToast] = useState('');
+  const isMobileRef = useRef(isMobile);
+  const layersRef = useRef([]); // стек «слоёв» для системной кнопки «назад»
+  const gestureRef = useRef(null);
+  const pullRef = useRef(null);
+  const pullPxRef = useRef(0);
+  const listScrollRef = useRef(null);
+  const pressTimerRef = useRef(null);
+  const longPressRef = useRef(false);
+  const toastTimerRef = useRef(null);
+
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
@@ -79,6 +102,10 @@ function App() {
         const wanted = selectId || current;
         if (wanted && list.some((chat) => chat.id === wanted)) {
           return wanted;
+        }
+        // На мобильном список чатов — первый экран: ничего не открываем автоматически.
+        if (isMobileRef.current) {
+          return null;
         }
         const general = list.find((chat) => chat.id === 1);
         if (general) {
@@ -410,6 +437,43 @@ function App() {
     loadStickerManifest();
   }, []);
 
+  // Синхронизация мобильного режима.
+  useEffect(() => {
+    isMobileRef.current = isMobile;
+  }, [isMobile]);
+
+  useEffect(() => {
+    const mq = window.matchMedia(MOBILE_MQ);
+    const handler = (event) => setIsMobile(event.matches);
+    mq.addEventListener?.('change', handler);
+    return () => mq.removeEventListener?.('change', handler);
+  }, []);
+
+  // Системная кнопка «назад» (Android): закрывает верхний слой
+  // (открытый чат → модалка → нижний лист), как в Signal.
+  useEffect(() => {
+    if (!isMobile) {
+      return undefined;
+    }
+    const onPop = () => {
+      const layer = layersRef.current.pop();
+      if (layer === 'chat') {
+        setMobileChatOpen(false);
+      } else if (layer === 'modal') {
+        setModal(null);
+        setChatError('');
+      } else if (layer === 'compose') {
+        setComposeOpen(false);
+      } else if (layer === 'settings') {
+        setSettingsOpen(false);
+      } else if (layer === 'context') {
+        setContextChat(null);
+      }
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, [isMobile]);
+
   const activeStickerPack = stickerPacks.find((pack) => pack.id === activePack);
 
   const handleSendMessage = (e) => {
@@ -642,7 +706,11 @@ function App() {
     setServerState(normalized);
     setServerDraft(normalized);
     setServerError('');
-    setSettingsOpen(false);
+    if (isMobileRef.current && layersRef.current[layersRef.current.length - 1] === 'settings') {
+      window.history.back();
+    } else {
+      setSettingsOpen(false);
+    }
     setShowServerSetup(false);
 
     // токен и история относились к другому серверу
@@ -707,11 +775,37 @@ function App() {
     setChats([]);
     setActiveChatId(null);
     setSidebarOpen(false);
+    setMobileChatOpen(false);
+    setContextChat(null);
+    setComposeOpen(false);
+    layersRef.current = [];
   };
 
   const selectChat = (chatId) => {
     setActiveChatId(chatId);
     setSidebarOpen(false);
+    if (isMobileRef.current) {
+      // Мобильный UX: чат открывается отдельным экраном поверх списка.
+      setContextChat(null);
+      setComposeOpen(false);
+      setModal(null);
+      setChatError('');
+      if (layersRef.current.length) {
+        layersRef.current[layersRef.current.length - 1] = 'chat';
+        window.history.replaceState({ gorLayer: 'chat' }, '');
+      } else {
+        pushLayer('chat');
+      }
+      setMobileChatOpen(true);
+    }
+  };
+
+  const closeChatMobile = () => {
+    if (layersRef.current[layersRef.current.length - 1] === 'chat') {
+      window.history.back();
+      return;
+    }
+    setMobileChatOpen(false);
   };
 
   const openModal = (mode) => {
@@ -721,9 +815,23 @@ function App() {
     setSearchResults([]);
     setGroupTitle('');
     setGroupMembers([]);
+    if (isMobileRef.current) {
+      const top = layersRef.current[layersRef.current.length - 1];
+      if (top === 'compose' || top === 'context') {
+        // Один слой истории заменяем другим, чтобы «назад» не зависал.
+        layersRef.current[layersRef.current.length - 1] = 'modal';
+        window.history.replaceState({ gorLayer: 'modal' }, '');
+      } else {
+        pushLayer('modal');
+      }
+    }
   };
 
   const closeModal = () => {
+    if (isMobileRef.current && layersRef.current[layersRef.current.length - 1] === 'modal') {
+      window.history.back();
+      return;
+    }
     setModal(null);
     setChatError('');
   };
@@ -742,7 +850,7 @@ function App() {
       }
       const data = JSON.parse(text);
       await loadChats(data.chat.id);
-      setModal(null);
+      closeModal();
     } catch (error) {
       setChatError(error.message || 'Не удалось создать чат');
     }
@@ -777,7 +885,7 @@ function App() {
       }
       const data = JSON.parse(text);
       await loadChats(data.chat.id);
-      setModal(null);
+      closeModal();
     } catch (error) {
       setChatError(error.message || 'Не удалось создать группу');
     }
@@ -787,6 +895,9 @@ function App() {
     setServerDraft(server);
     setServerError('');
     setSettingsOpen(true);
+    if (isMobileRef.current) {
+      pushLayer('settings');
+    }
     if (isDesktop()) {
       try {
         const plugin = await import('@tauri-apps/plugin-autostart');
@@ -810,6 +921,229 @@ function App() {
     } catch (error) {
       console.error('autostart toggle:', error);
     }
+  };
+
+  // --- Мобильные жесты и слои интерфейса ---
+  const pushLayer = (key) => {
+    layersRef.current.push(key);
+    window.history.pushState({ gorLayer: key }, '');
+  };
+
+  const showToast = (text) => {
+    setToast(text);
+    clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToast(''), 1800);
+  };
+
+  const openCompose = () => {
+    setComposeOpen(true);
+    if (isMobileRef.current) {
+      pushLayer('compose');
+    }
+  };
+
+  const closeCompose = () => {
+    if (isMobileRef.current && layersRef.current[layersRef.current.length - 1] === 'compose') {
+      window.history.back();
+      return;
+    }
+    setComposeOpen(false);
+  };
+
+  // Выбор из FAB-листа: слой «выбора» превращается в слой модалки (openModal сам заменит).
+  const composePick = (mode) => {
+    setComposeOpen(false);
+    openModal(mode);
+  };
+
+  const closeContext = () => {
+    if (layersRef.current[layersRef.current.length - 1] === 'context') {
+      window.history.back();
+      return;
+    }
+    setContextChat(null);
+  };
+
+  // Открытие чата из листа по долгому нажатию: слой листа → слой чата.
+  const openContextChat = () => {
+    const chat = contextChat;
+    setContextChat(null);
+    if (!chat) {
+      return;
+    }
+    setActiveChatId(chat.id);
+    setMobileChatOpen(true);
+    if (layersRef.current.length) {
+      layersRef.current[layersRef.current.length - 1] = 'chat';
+      window.history.replaceState({ gorLayer: 'chat' }, '');
+    } else {
+      pushLayer('chat');
+    }
+  };
+
+  // Свайп вправо от левого края = «назад» к списку чатов.
+  const onChatTouchStart = (event) => {
+    if (!isMobileRef.current || !mobileChatOpen) {
+      return;
+    }
+    const touch = event.touches[0];
+    if (touch.clientX > 60) {
+      return;
+    }
+    gestureRef.current = { x0: touch.clientX, y0: touch.clientY, dx: 0, dy: 0, prevDx: 0, velocity: 0, dragging: false };
+  };
+
+  const onChatTouchMove = (event) => {
+    const gesture = gestureRef.current;
+    if (!gesture) {
+      return;
+    }
+    const touch = event.touches[0];
+    gesture.dx = touch.clientX - gesture.x0;
+    gesture.dy = touch.clientY - gesture.y0;
+    if (!gesture.dragging && gesture.dx > 14 && Math.abs(gesture.dx) > Math.abs(gesture.dy)) {
+      gesture.dragging = true;
+      setMobileSwiping(true);
+    }
+    if (gesture.dragging) {
+      // «скорость» свайпа по последнему шагу — для быстрого флика
+      gesture.velocity = gesture.dx - (gesture.prevDx || 0);
+      gesture.prevDx = gesture.dx;
+      setMobileSwipe(Math.max(0, Math.min(gesture.dx, window.innerWidth * 0.8)));
+    }
+  };
+
+  const onChatTouchEnd = () => {
+    const gesture = gestureRef.current;
+    gestureRef.current = null;
+    if (!gesture || !gesture.dragging) {
+      return;
+    }
+    const width = window.innerWidth || 1;
+    // довели до трети экрана или быстрый флик — закрываем чат
+    const shouldClose = gesture.dx > width * 0.3 || (gesture.dx > 60 && gesture.velocity > 14);
+    if (!shouldClose) {
+      // возврат пружиной обратно
+      setMobileSwiping(false);
+      setMobileSwipe(0);
+      return;
+    }
+    // Плавно «дозакрываем» экран анимацией и синхронизируем историю.
+    setMobileSwiping(false);
+    setMobileSwipe(0);
+    setMobileChatOpen(false);
+    window.history.back();
+  };
+
+  // Pull-to-refresh в списке чатов (как в Signal: тянешь вниз — список обновляется).
+  const onListTouchStart = (event) => {
+    if (!isMobileRef.current) {
+      return;
+    }
+    const list = listScrollRef.current;
+    if (!list || list.scrollTop > 0) {
+      return;
+    }
+    const touch = event.touches[0];
+    pullRef.current = { y0: touch.clientY, dy: 0 };
+  };
+
+  const onListTouchMove = (event) => {
+    const drag = pullRef.current;
+    if (!drag) {
+      return;
+    }
+    const touch = event.touches[0];
+    drag.dy = touch.clientY - drag.y0;
+    if (drag.dy > 0) {
+      pullPxRef.current = Math.min(90, drag.dy * 0.45);
+      setPullPx(pullPxRef.current);
+    }
+  };
+
+  const onListTouchEnd = () => {
+    const drag = pullRef.current;
+    pullRef.current = null;
+    if (!drag || drag.dy <= 0) {
+      return;
+    }
+    if (pullPxRef.current > 55) {
+      pullPxRef.current = 0;
+      setPullPx(64);
+      setPulling(true);
+      loadChats().finally(() => {
+        setPulling(false);
+        setPullPx(0);
+      });
+    } else {
+      pullPxRef.current = 0;
+      setPullPx(0);
+    }
+  };
+
+  // Долгое нажатие на чат → нижний лист (Signal-style).
+  const startLongPress = (chat) => () => {
+    longPressRef.current = false;
+    clearTimeout(pressTimerRef.current);
+    pressTimerRef.current = setTimeout(() => {
+      longPressRef.current = true;
+      setContextChat(chat);
+      if (isMobileRef.current) {
+        pushLayer('context');
+      }
+    }, 420);
+  };
+
+  const cancelLongPress = () => {
+    clearTimeout(pressTimerRef.current);
+  };
+
+  const onChatItemClick = (chat) => () => {
+    if (longPressRef.current) {
+      longPressRef.current = false;
+      return;
+    }
+    selectChat(chat.id);
+  };
+
+  // Долгое нажатие на сообщение → копировать текст.
+  const startMsgPress = (msg) => () => {
+    longPressRef.current = false;
+    clearTimeout(pressTimerRef.current);
+    pressTimerRef.current = setTimeout(() => {
+      longPressRef.current = true;
+      const parts = [];
+      if (msg.text) {
+        parts.push(msg.text);
+      }
+      if (msg.fileUrl && msg.fileName) {
+        parts.push(msg.fileName);
+      }
+      const text = parts.join(' ').trim();
+      if (!text || !navigator.clipboard?.writeText) {
+        return;
+      }
+      navigator.clipboard.writeText(text)
+        .then(() => showToast('Скопировано в буфер обмена'))
+        .catch(() => showToast('Не удалось скопировать'));
+    }, 420);
+  };
+
+  const onMsgContext = (msg) => (event) => {
+    event.preventDefault();
+    if (msg.text && navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(msg.text)
+        .then(() => showToast('Скопировано в буфер обмена'))
+        .catch(() => {});
+    }
+  };
+
+  const closeSettings = () => {
+    if (isMobileRef.current && layersRef.current[layersRef.current.length - 1] === 'settings') {
+      window.history.back();
+      return;
+    }
+    setSettingsOpen(false);
   };
 
   const openLightbox = (fileUrl) => {
@@ -1014,7 +1348,7 @@ function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${isMobile ? 'mobile' : ''}`}>
       <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
         <div className="sidebar-header">
           <div>
@@ -1029,7 +1363,22 @@ function App() {
           <button type="button" className="new-group-button" onClick={() => openModal('group')}>＋ ГРУППА</button>
         </div>
 
-        <div className="chat-list">
+        <div
+          className={`pull-refresh ${pulling ? 'pulling' : ''}`}
+          style={{ height: `${pullPx}px` }}
+        >
+          {pullPx > 8 && (
+            <span className="pull-spinner" style={{ transform: `rotate(${pullPx * 4}deg)` }}></span>
+          )}
+        </div>
+
+        <div
+          className={`chat-list ${pulling ? 'pulling' : ''}`}
+          ref={listScrollRef}
+          onTouchStart={onListTouchStart}
+          onTouchMove={onListTouchMove}
+          onTouchEnd={onListTouchEnd}
+        >
           {chatsLoading && chats.length === 0 && <div className="chat-list-hint">Загрузка…</div>}
           {!chatsLoading && chats.length === 0 && <div className="chat-list-hint">Пока нет чатов</div>}
           {chats.map((chat) => (
@@ -1037,7 +1386,10 @@ function App() {
               key={chat.id}
               type="button"
               className={`chat-item ${chat.id === activeChatId ? 'active' : ''}`}
-              onClick={() => selectChat(chat.id)}
+              onPointerDown={startLongPress(chat)}
+              onPointerUp={cancelLongPress}
+              onPointerLeave={cancelLongPress}
+              onClick={onChatItemClick(chat)}
             >
               <div className="chat-item-top">
                 <span className="chat-item-title">
@@ -1062,17 +1414,22 @@ function App() {
             <span className={`indicator ${isConnected ? 'connected' : 'disconnected'}`}></span>
             {isConnected ? 'ONLINE' : 'OFFLINE'} · {onlineCount}
           </span>
-          {isDesktop() && (
-            <button type="button" className="icon-button" title="Настройки" onClick={openSettings}>⚙</button>
-          )}
+          <button type="button" className="icon-button" title="Настройки" onClick={openSettings}>⚙</button>
           <button type="button" className="icon-button" title="Выйти из аккаунта" onClick={handleLogout}>⏻</button>
         </div>
       </aside>
 
       {sidebarOpen && <div className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} />}
 
-      <main className="chat-main">
+      <main
+        className={`chat-main ${mobileChatOpen ? 'open' : ''} ${mobileSwiping ? 'swiping' : ''}`}
+        onTouchStart={onChatTouchStart}
+        onTouchMove={onChatTouchMove}
+        onTouchEnd={onChatTouchEnd}
+        style={mobileSwiping ? { transform: `translateX(${mobileSwipe}px)`, transition: 'none' } : undefined}
+      >
         <header className="chat-header">
+          <button type="button" className="back-button" onClick={closeChatMobile} title="Назад к чатам">‹</button>
           <button type="button" className="menu-button" onClick={() => setSidebarOpen((open) => !open)} title="Чаты">
             ☰
           </button>
@@ -1119,11 +1476,17 @@ function App() {
             <div
               key={`${msg.chatId}-${msg.id}-${idx}`}
               className={`message ${msg.username === 'System' ? 'system' : 'user'} ${msg.userId && user && msg.userId === user.id ? 'own' : ''}`}
+              onPointerDown={startMsgPress(msg)}
+              onPointerUp={cancelLongPress}
+              onPointerLeave={cancelLongPress}
+              onContextMenu={onMsgContext(msg)}
+              title="Долгое нажатие — копировать"
             >
-              <span className="username-label">[{msg.username}]</span>
-              &nbsp;
-              <span className="timestamp">{msg.timestamp}</span>
-              <br />
+              <div className="msg-head">
+                <span className="msg-avatar">{(msg.username?.[0] || '?').toUpperCase()}</span>
+                <span className="username-label">[{msg.username}]</span>
+                <span className="timestamp">{msg.timestamp}</span>
+              </div>
               {msg.text && <span className="message-text">&gt; {msg.text}</span>}
               {renderMessageContent(msg)}
             </div>
@@ -1316,7 +1679,7 @@ function App() {
       )}
 
       {settingsOpen && (
-        <div className="settings-overlay" onClick={() => setSettingsOpen(false)}>
+        <div className="settings-overlay" onClick={closeSettings}>
           <form
             className="settings-card"
             onClick={(e) => e.stopPropagation()}
@@ -1349,7 +1712,7 @@ function App() {
               <button
                 type="button"
                 className="settings-cancel"
-                onClick={() => setSettingsOpen(false)}
+                onClick={closeSettings}
               >
                 ОТМЕНА
               </button>
@@ -1367,6 +1730,49 @@ function App() {
           </div>
         </div>
       )}
+
+      {/* --- Мобильные жестовые элементы (FAB, нижние листы, toast) --- */}
+      {isMobile && !mobileChatOpen && (
+        <button type="button" className="compose-fab" onClick={openCompose} aria-label="Новый чат">＋</button>
+      )}
+
+      {composeOpen && (
+        <div className="sheet-overlay" onClick={closeCompose}>
+          <div className="bottom-sheet" onClick={(e) => e.stopPropagation()}>
+            <div className="sheet-handle"></div>
+            <button type="button" className="sheet-item" onClick={() => composePick('direct')}>
+              <span className="sheet-emoji">👤</span> Новый личный чат
+            </button>
+            <button type="button" className="sheet-item" onClick={() => composePick('group')}>
+              <span className="sheet-emoji">👥</span> Новая группа
+            </button>
+          </div>
+        </div>
+      )}
+
+      {contextChat && (
+        <div className="sheet-overlay" onClick={closeContext}>
+          <div className="bottom-sheet" onClick={(e) => e.stopPropagation()}>
+            <div className="sheet-handle"></div>
+            <div className="sheet-title">
+              {contextChat.type === 'group' ? '# ' : '@ '}
+              {contextChat.title || contextChat.peer || 'Чат'}
+            </div>
+            <div className="sheet-sub">
+              {contextChat.type === 'group' ? 'Групповой чат' : 'Личный чат'}
+              {contextChat.unread > 0 ? ` · ${contextChat.unread} непрочитанных` : ''}
+            </div>
+            <button type="button" className="sheet-item" onClick={openContextChat}>
+              <span className="sheet-emoji">💬</span> Открыть чат
+            </button>
+            <button type="button" className="sheet-item" onClick={closeContext}>
+              <span className="sheet-emoji">✕</span> Отмена
+            </button>
+          </div>
+        </div>
+      )}
+
+      {toast && <div className="toast">{toast}</div>}
     </div>
   );
 }
