@@ -223,12 +223,23 @@ function App() {
     const ws = new WebSocket(serverWsUrl(getToken()));
 
     ws.onopen = () => {
-      console.log('Connected to WebSocket');
-      setIsConnected(true);
+      // Авторизация первым кадром — токен не светится в URL/логах прокси.
+      ws.send(JSON.stringify({ type: 'auth', token: getToken() }));
     };
 
     ws.onmessage = (event) => {
       const message = JSON.parse(event.data);
+
+      if (message.type === 'auth_ok') {
+        console.log('WS авторизован');
+        setIsConnected(true);
+        return;
+      }
+      if (message.type === 'auth_error') {
+        console.warn('WS: токен отклонён');
+        setIsConnected(false);
+        return;
+      }
       if (!message.chatId) {
         message.chatId = 1;
       }

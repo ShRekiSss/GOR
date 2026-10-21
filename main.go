@@ -954,16 +954,36 @@ func (c *Client) writePump() {
 }
 
 func handleWS(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireUser(w, r)
-	if !ok {
-		return
-	}
-
+	// Апгрейд соединения делаем сразу, а авторизацию — первым кадром:
+	// токен больше не передаётся в query-строке, чтобы не попадать в логи прокси.
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println(err)
 		return
 	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+	authMsg := struct {
+		Type  string `json:"type"`
+		Token string `json:"token"`
+	}{}
+	if err := conn.ReadJSON(&authMsg); err != nil || authMsg.Type != "auth" {
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "auth required"),
+			time.Now().Add(time.Second))
+		conn.Close()
+		return
+	}
+
+	user, err := db.UserByToken(authMsg.Token)
+	if err != nil {
+		_ = conn.WriteJSON(map[string]string{"type": "auth_error"})
+		conn.Close()
+		return
+	}
+	_ = conn.WriteJSON(map[string]string{"type": "auth_ok"})
+	// Токен подтверждён — снимаем жёсткий дедлайн (далее им управляет readPump).
+	_ = conn.SetReadDeadline(time.Time{})
 
 	client := &Client{
 		hub:      hub,
@@ -1048,9 +1068,12 @@ func tokenFromRequest(r *http.Request) string {
 	if header := r.Header.Get("Authorization"); strings.HasPrefix(header, "Bearer ") {
 		return strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
 	}
-	// Браузерный WebSocket не умеет заголовки — токен передаётся в query.
-	if token := r.URL.Query().Get("token"); token != "" {
-		return token
+	// Медиа-теги (<img>/<video>/<audio>) не умеют заголовки, поэтому файлы
+	// можно тянуть с токеном в параметре ?t= — только для путей файлов.
+	if strings.HasPrefix(r.URL.Path, "/uploads/") || r.URL.Path == "/api/download" {
+		if token := r.URL.Query().Get("t"); token != "" {
+			return token
+		}
 	}
 	if cookie, err := r.Cookie("gor_session"); err == nil {
 		return cookie.Value
@@ -1558,6 +1581,15 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ---------- Раздача файлов: только участникам чата ----------
+
+// ChatIDByUpload возвращает chat_id сообщения, к которому прикреплён файл.
+func (d *Database) ChatIDByUpload(fileURL string) (int64, error) {
+	var chatID int64
+	err := d.db.QueryRow(`SELECT COALESCE(chat_id, 1) FROM messages WHERE file_url = ? ORDER BY id LIMIT 1`, fileURL).Scan(&chatID)
+	return chatID, err
+}
+
 // resolveUploadPath возвращает путь внутри uploads или ошибку.
 func resolveUploadPath(name string) (string, error) {
 	uploadsDir, err := filepath.Abs(config.UploadDir)
@@ -1572,7 +1604,49 @@ func resolveUploadPath(name string) (string, error) {
 	return candidate, nil
 }
 
+// handleUploadsRead отдаёт файлы из /uploads только участникам чата,
+// к которому файл прикреплён сообщением.
+func handleUploadsRead(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
+
+	name := filepath.Base(r.URL.Path) // Base отсекает path traversal
+	path, err := resolveUploadPath(name)
+	if err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Привязка к чату — по сообщению с этим file_url.
+	chatID, chatErr := db.ChatIDByUpload("/uploads/" + name)
+	if chatErr != nil && !db.IsMember(1, user.ID) {
+		// Файл без привязки к сообщению (старые релизы): разрешаем только
+		// участникам «Общего чата», куда входят все пользователи.
+		http.Error(w, "Нет доступа к файлу", http.StatusForbidden)
+		return
+	}
+	if chatErr == nil && !db.IsMember(chatID, user.ID) {
+		http.Error(w, "Нет доступа к файлу", http.StatusForbidden)
+		return
+	}
+
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	http.ServeFile(w, r, path)
+}
+
 func handleDownload(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
+
 	filePath, err := resolveUploadPath(r.URL.Query().Get("file"))
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
@@ -1585,6 +1659,19 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Та же проверка доступа, что и у /uploads/: файл = сообщение = чат.
+	name := filepath.Base(filePath)
+	chatID, chatErr := db.ChatIDByUpload("/uploads/" + name)
+	if chatErr != nil && !db.IsMember(1, user.ID) {
+		http.Error(w, "Нет доступа к файлу", http.StatusForbidden)
+		return
+	}
+	if chatErr == nil && !db.IsMember(chatID, user.ID) {
+		http.Error(w, "Нет доступа к файлу", http.StatusForbidden)
+		return
+	}
+
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	http.ServeFile(w, r, filePath)
 }
 
@@ -1644,7 +1731,7 @@ func main() {
 	mux.HandleFunc("/api/chats/", handleChatSubroutes)
 	mux.HandleFunc("/api/upload", handleUpload)
 	mux.HandleFunc("/api/download", handleDownload)
-	mux.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir(config.UploadDir))))
+	mux.HandleFunc("/uploads/", handleUploadsRead)
 
 	if _, err := os.Stat(config.StaticDir); err == nil {
 		mux.Handle("/", http.FileServer(http.Dir(config.StaticDir)))

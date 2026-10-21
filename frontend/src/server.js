@@ -2,6 +2,7 @@
 // В браузере по умолчанию используется тот же origin (пустая строка).
 // В desktop-приложении (Tauri) адрес сервера задаётся пользователем и
 // сохраняется в localStorage.
+import { getToken } from './auth';
 
 const STORAGE_KEY = 'gor_server_url';
 
@@ -53,25 +54,37 @@ export function apiUrl(path) {
 }
 
 // Приводит ссылку из сообщения (/uploads/..., /stickers/...) к серверу.
+// Для приватных /uploads/* добавляем одноразовый по времени токен в query:
+// теги <img>/<video>/<audio> не умеют слать Authorization.
 export function resolveUrl(url) {
   if (!url) return url;
   if (/^(https?:|data:|blob:)/i.test(url)) return url;
   const server = getServer();
-  return server ? server + (url.startsWith('/') ? url : '/' + url) : url;
+  const full = server
+    ? server + (url.startsWith('/') ? url : '/' + url)
+    : url;
+  if (full.includes('/uploads/')) {
+    const token = getToken();
+    if (token) {
+      return `${full}${full.includes('?') ? '&' : '?'}t=${encodeURIComponent(token)}`;
+    }
+  }
+  return full;
 }
 
-export function serverWsUrl(token) {
-  const query = token ? `?token=${encodeURIComponent(token)}` : '';
+// Токен к WS больше не идёт в URL (чтоб не попадал в логи прокси):
+// клиент отправляет его первым кадром после открытия соединения.
+export function serverWsUrl() {
   const server = getServer();
   if (server) {
     try {
       const parsed = new URL(server);
       const protocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:';
-      return `${protocol}//${parsed.host}/ws${query}`;
+      return `${protocol}//${parsed.host}/ws`;
     } catch (e) {
       // некорректный адрес — падаем обратно на текущий origin
     }
   }
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${window.location.host}/ws${query}`;
+  return `${protocol}//${window.location.host}/ws`;
 }
