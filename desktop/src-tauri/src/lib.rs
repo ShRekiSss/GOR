@@ -16,7 +16,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .run(tauri::generate_context!())
-        .expect("error while running GOR");
+        .expect("error while running VAKSA");
 }
 
 #[cfg(desktop)]
@@ -32,12 +32,12 @@ pub fn run() {
             None,
         ))
         .setup(|app| {
-            let open = MenuItem::with_id(app, "open", "Открыть GOR", true, None::<&str>)?;
+            let open = MenuItem::with_id(app, "open", "Открыть VAKSA", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &quit])?;
 
             let mut tray = TrayIconBuilder::with_id("main-tray")
-                .tooltip("GOR — мессенджер")
+                .tooltip("VAKSA — мессенджер")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -71,5 +71,5 @@ pub fn run() {
             }
         })
         .run(tauri::generate_context!())
-        .expect("error while running GOR");
+        .expect("error while running VAKSA");
 }

@@ -136,7 +136,7 @@ function App() {
 
   const notify = useCallback(async (message) => {
     if (!user || message.userId === user.id) return;
-    const title = message.username || 'GOR';
+    const title = message.username || 'VAKSA';
     const body = message.text || 'Новое сообщение';
 
     try {
@@ -1256,7 +1256,7 @@ function App() {
             applyServer(serverDraft);
           }}
         >
-          <h1>GOR</h1>
+          <h1>VAKSA</h1>
           <p className="setup-subtitle">Подключение к серверу</p>
           <input
             type="text"
@@ -1280,7 +1280,7 @@ function App() {
     return (
       <div className="setup-screen">
         <div className="setup-card auth-checking">
-          <h1>GOR</h1>
+          <h1>VAKSA</h1>
           <p className="setup-subtitle">Подключение…</p>
         </div>
       </div>
@@ -1291,7 +1291,7 @@ function App() {
     return (
       <div className="setup-screen">
         <form className="setup-card" onSubmit={handleAuthSubmit}>
-          <h1>GOR</h1>
+          <h1>VAKSA</h1>
           <p className="setup-subtitle">
             {authMode === 'login' ? 'Вход в аккаунт' : 'Создание аккаунта'}
           </p>
@@ -1352,7 +1352,7 @@ function App() {
       <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
         <div className="sidebar-header">
           <div>
-            <div className="brand">GOR<span>CHAT</span></div>
+            <div className="brand">VAKSA<span>CHAT</span></div>
             <div className="sidebar-me">@{username}</div>
           </div>
           <span className={`indicator ${isConnected ? 'connected' : 'disconnected'}`} title={isConnected ? 'На связи' : 'Нет связи'}></span>
@@ -1437,7 +1437,7 @@ function App() {
             <h2>
               {activeChat
                 ? `${activeChat.type === 'group' ? '# ' : '@ '}${activeChat.title || activeChat.peer || 'Чат'}`
-                : 'GOR CHAT'}
+                : 'VAKSA CHAT'}
             </h2>
             <span className="chat-sub">
               {activeChat
@@ -1460,7 +1460,7 @@ function App() {
         >
           {!activeChat && (
             <div className="welcome-message">
-              &gt; Добро пожаловать в GOR CHAT<br />
+              &gt; Добро пожаловать в VAKSA CHAT<br />
               &gt; Выберите чат в списке слева<br />
               &gt; Или создайте личный диалог / группу<br />
               &gt; Файлы и сообщения сохраняются в истории

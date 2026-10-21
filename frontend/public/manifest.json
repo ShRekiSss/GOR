@@ -1,13 +1,13 @@
 {
-  "name": "GOR",
-  "short_name": "GOR",
-  "description": "GOR — лёгкий мессенджер в стиле ретро-терминала",
+  "name": "VAKSA",
+  "short_name": "VAKSA",
+  "description": "VAKSA — быстрый мессенджер в тёмной теме",
   "lang": "ru",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
-  "background_color": "#11141c",
-  "theme_color": "#11141c",
+  "background_color": "#0e1621",
+  "theme_color": "#0e1621",
   "icons": [
     {
       "src": "icons/icon-192.png",

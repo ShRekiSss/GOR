@@ -1,5 +1,5 @@
-/* GOR service worker: кэш оболочки приложения, API и WS всегда из сети. */
-const CACHE = 'gor-pwa-v1';
+/* VAKSA service worker: кэш оболочки приложения, API и WS всегда из сети. */
+const CACHE = 'vaksa-pwa-v1';
 const CORE = ['/', '/index.html', '/manifest.json'];
 
 self.addEventListener('install', (event) => {
