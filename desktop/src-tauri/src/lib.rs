@@ -1,7 +1,7 @@
-use tauri::menu::{Menu, MenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Manager, WindowEvent};
+#[cfg(desktop)]
+use tauri::Manager;
 
+#[cfg(desktop)]
 fn show_main(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -11,7 +11,21 @@ fn show_main(app: &tauri::AppHandle) {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+#[cfg(mobile)]
 pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
+        .run(tauri::generate_context!())
+        .expect("error while running GOR");
+}
+
+#[cfg_attr(not(mobile), tauri::mobile_entry_point)]
+#[cfg(not(mobile))]
+pub fn run() {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+    use tauri::WindowEvent;
+
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(

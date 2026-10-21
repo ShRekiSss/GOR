@@ -262,8 +262,8 @@ desktop/
 - [ ] Подпись пакетов
 
 ### 6. Android
-- [ ] PWA-манифест и service worker (быстрый шаг)
-- [ ] Сборка Android в Tauri 2 (тот же React-клиент)
+- [x] PWA-манифест, service worker и иконки (устанавливается как приложение)
+- [x] Локальная сборка APK в Tauri 2 (тот же React-клиент)
 - [ ] Пуш-уведомления (FCM)
 
 ### 7. Стиль и название
@@ -280,6 +280,34 @@ desktop/
 - Сквозного шифрования пока нет: сервер видит сообщения в базе.
 - Для продакшена используйте HTTPS (Caddy/туннель) и регулярные бэкапы.
 - `chat.db` и `uploads/` не должны попадать в git (см. `.gitignore`).
+
+
+## Android (PWA / APK)
+
+Два пути на телефоне:
+
+1. **PWA** — открыть сайт в Chrome и «Установить приложение»: есть manifest,
+   service worker, полноэкранный режим и иконка.
+2. **APK** — собрать локально (нужны SDK/Ndk):
+
+```bash
+# один раз: SDK (android-35, build-tools 35.0.0, NDK 29 крупно) и целевой arch
+rustup target add aarch64-linux-android armv7-linux-androideabi \
+                    x86_64-linux-android i686-linux-android
+
+# генерируем gen/android один раз
+cd desktop && npx tauri android init --ci
+
+# сборка универсального APK (release-сборка без подписи)
+cd desktop && npx tauri android build --ci --apk
+
+# подпись (ключ лежит где-то локально)
+$BUILD_TOOLS/zipalign -f 4 app-universal-release-unsigned.apk aligned.apk
+$BUILD_TOOLS/apksigner sign --ks <key> --ks-key-alias <alias> \
+    --out gor-android.apk aligned.apk
+```
+
+Пакет: `com.gor.messenger`, версия `0.5.0`. APK универсальный (arm64, armv7, x86, x86_64).
 
 ## Лицензия
 

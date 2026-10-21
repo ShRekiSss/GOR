@@ -9,3 +9,13 @@ root.render(
     <App />
   </React.StrictMode>
 );
+
+// PWA: регистрируем service worker (в desktop-версии не мешает — если что, тихо игнорим)
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(() => {
+      /* PWA недоступна в текущем окружении (Tauri/локальный файл) — не критично */
+    });
+  });
+}
+

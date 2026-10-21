@@ -34,6 +34,11 @@
 - Windows: portable `.exe` и NSIS-установщик `GOR_0.5.0-beta_x64-setup.exe`.
 - Linux: `.deb` (AppImage — при наличии корректного pkg-config).
 
+### Android
+
+- PWA: manifest, service worker, иконки — сайт ставится как приложение.
+- APK через Tauri 2 (universal, 4 ABI), подписанный локальным ключом.
+
 ### Известные ограничения
 
 - Нет сквозного шифрования; сервер хранит сообщения в открытом виде в SQLite.
