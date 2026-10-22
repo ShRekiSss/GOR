@@ -217,14 +217,17 @@ jobs:
         working-directory: desktop
         run: |
           npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
-          # gradle пишет debug-keystore в пользовательский ".android":
-          # на раннере путь занят root'ом — уводим в ANDROID_USER_HOME и чиним права.
+          # gradle/AGP пишет служебные директории в пользовательский ".android":
+          # на раннере эти пути созданы root'ом и не пишутся → AGP-плагин падает.
           export ANDROID_USER_HOME="$RUNNER_TEMP/android-user-home"
           export ANDROID_SDK_HOME="$RUNNER_TEMP/android-user-home"
-          mkdir -p "$ANDROID_USER_HOME"
-          sudo chown -R "$(id -un):$(id -gn)" "$HOME/.config" 2>/dev/null || true
+          sudo mkdir -p "$HOME/.config/.android" "$ANDROID_HOME/.android"
+          sudo chmod -R a+rwX "$HOME/.config/.android" "$ANDROID_HOME/.android" "$HOME/.config" 2>/dev/null || true
+          sudo chown -R "$(id -un):$(id -gn)" "$HOME/.config/.android" "$ANDROID_HOME/.android" 2>/dev/null || true
           npx tauri android init --ci
           bash patch-android-permissions.sh
+          # ValueSource AndroidDirectoryCreator падает под configuration cache — отключаем.
+          printf '\norg.gradle.configuration-cache=false\n' >> src-tauri/gen/android/gradle.properties
           # Если секреты подписи заданы — релизная подпись; иначе debug-APK (ставится на любую телефон)
           if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
             echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > src-tauri/release.jks
