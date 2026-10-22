@@ -53,6 +53,13 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [inputValue, setInputValue] = useState('');
   const [user, setUser] = useState(null);
+  // ТГ-стиль: ответ на сообщение, редактирование, меню по долгому тапу, «печатает…».
+  const [replyTo, setReplyTo] = useState(null);
+  const [editingMsg, setEditingMsg] = useState(null);
+  const [msgMenu, setMsgMenu] = useState(null);
+  const [typingUser, setTypingUser] = useState('');
+  const typingSentRef = useRef(0);   // троттлинг outgoing typing
+  const typingClearRef = useRef(null); // таймер скрытия индикатора
   const [authChecking, setAuthChecking] = useState(true);
   const [authMode, setAuthMode] = useState('login');
   const [authForm, setAuthForm] = useState({ username: '', password: '', pass2: '' });
@@ -375,6 +382,26 @@ function App() {
           return;
         }
 
+        if (incoming.type === 'typing') {
+          // «X печатает…» — только для открытого чата и не от себя.
+          if (incoming.chatId === activeChatRef.current && incoming.userId !== user.id) {
+            setTypingUser(incoming.username || 'Кто-то');
+            clearTimeout(typingClearRef.current);
+            typingClearRef.current = setTimeout(() => setTypingUser(''), 3500);
+          }
+          return;
+        }
+        if (incoming.type === 'edit') {
+          setMessages((prev) => prev.map((m) => (m.id === incoming.id ? { ...m, text: incoming.text, edited: 1 } : m)));
+          return;
+        }
+        if (incoming.type === 'delete') {
+          setMessages((prev) => prev.map((m) => (m.id === incoming.id
+            ? { ...m, text: incoming.text || 'Сообщение удалено', type: 'deleted', edited: 0, replyTo: 0 }
+            : m)));
+          return;
+        }
+
         const message = incoming;
         if (!message.chatId) {
           message.chatId = 1;
@@ -686,10 +713,32 @@ function App() {
 
   const activeStickerPack = stickerPacks.find((pack) => pack.id === activePack);
 
+  const handleInputChange = (e) => {
+    setInputValue(e.target.value);
+    // «Печатает…» — не чаще раза в 2.5 секунды.
+    const now = Date.now();
+    if (
+      activeChatId
+      && wsRef.current?.readyState === WebSocket.OPEN
+      && now - typingSentRef.current > 2500
+    ) {
+      typingSentRef.current = now;
+      wsRef.current.send(JSON.stringify({ type: 'typing', chatId: activeChatId }));
+    }
+  };
+
   const handleSendMessage = (e) => {
     e.preventDefault();
-    
+
     if (!inputValue.trim() || !activeChatId || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    // Режим правки: не создаём новое сообщение, а обновляем своё.
+    if (editingMsg) {
+      wsRef.current.send(JSON.stringify({ type: 'edit', messageId: editingMsg.id, text: inputValue }));
+      setEditingMsg(null);
+      setInputValue('');
       return;
     }
 
@@ -699,9 +748,13 @@ function App() {
       text: inputValue,
       type: 'text',
     };
+    if (replyTo?.id) {
+      message.replyTo = replyTo.id;
+    }
 
     wsRef.current.send(JSON.stringify(message));
     setInputValue('');
+    setReplyTo(null);
   };
 
   const handleStickerButtonClick = () => {
@@ -1323,36 +1376,19 @@ function App() {
     selectChat(chat.id);
   };
 
-  // Долгое нажатие на сообщение → копировать текст.
+  // Долгое нажатие на сообщение → меню: ответить / править / удалить / копировать.
   const startMsgPress = (msg) => () => {
     longPressRef.current = false;
     clearTimeout(pressTimerRef.current);
     pressTimerRef.current = setTimeout(() => {
       longPressRef.current = true;
-      const parts = [];
-      if (msg.text) {
-        parts.push(msg.text);
-      }
-      if (msg.fileUrl && msg.fileName) {
-        parts.push(msg.fileName);
-      }
-      const text = parts.join(' ').trim();
-      if (!text || !navigator.clipboard?.writeText) {
-        return;
-      }
-      navigator.clipboard.writeText(text)
-        .then(() => showToast('Скопировано в буфер обмена'))
-        .catch(() => showToast('Не удалось скопировать'));
+      setMsgMenu(msg);
     }, 420);
   };
 
   const onMsgContext = (msg) => (event) => {
     event.preventDefault();
-    if (msg.text && navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(msg.text)
-        .then(() => showToast('Скопировано в буфер обмена'))
-        .catch(() => {});
-    }
+    setMsgMenu(msg);
   };
 
   const closeSettings = () => {
@@ -1767,8 +1803,10 @@ function App() {
                 ? `${activeChat.type === 'group' ? '# ' : '@ '}${activeChat.title || activeChat.peer || 'Чат'}`
                 : 'VAKSA CHAT'}
             </h2>
-            <span className="chat-sub">
-              {activeChat
+            <span className={`chat-sub ${typingUser ? 'typing' : ''}`}>
+              {typingUser
+                ? `${typingUser} печатает…`
+                : activeChat
                 ? (activeChat.type === 'group' ? 'групповой чат' : 'личный чат')
                 : 'выберите чат или создайте новый'}
             </span>
@@ -1817,19 +1855,40 @@ function App() {
                 return (
                   <div
                     key={`${msg.chatId}-${msg.id}-${row.key}`}
-                    className={`message ${msg.username === 'System' ? 'system' : 'user'} ${msg.userId && user && msg.userId === user.id ? 'own' : ''}`}
+                    data-mid={msg.id}
+                    className={`message ${msg.username === 'System' ? 'system' : 'user'} ${msg.userId && user && msg.userId === user.id ? 'own' : ''} ${msg.type === 'deleted' ? 'deleted' : ''}`}
                     onPointerDown={startMsgPress(msg)}
                     onPointerUp={cancelLongPress}
                     onPointerLeave={cancelLongPress}
                     onContextMenu={onMsgContext(msg)}
-                    title="Долгое нажатие — копировать"
+                    title="Долгое нажатие — действия"
                   >
                     <div className="msg-head">
                       <span className="msg-avatar">{(msg.username?.[0] || '?').toUpperCase()}</span>
                       <span className="username-label">[{msg.username}]</span>
-                      <span className="timestamp">{localTime(msg.timestamp)}</span>
+                      <span className="timestamp">{localTime(msg.timestamp)}{msg.edited ? ' (изменено)' : ''}</span>
                     </div>
-                    {msg.text && <span className="message-text">&gt; {msg.text}</span>}
+                    {msg.replyTo ? (
+                      (() => {
+                        const q = messages.find((m) => m.id === msg.replyTo);
+                        return (
+                          <div
+                            className="msg-quote"
+                            onClick={() => document.querySelector(`[data-mid="${msg.replyTo}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })}
+                          >
+                            <span className="msg-quote-username">
+                              {q ? q.username : `сообщение #${msg.replyTo}`}
+                            </span>
+                            <span className="msg-quote-text">
+                              {q
+                                ? (q.text || (q.type === 'sticker' ? '🎨 Стикер' : (q.type === 'file' ? '📎 Файл' : ''))).slice(0, 110)
+                                : ' message not loaded'}
+                            </span>
+                          </div>
+                        );
+                      })()
+                    ) : null}
+                    {msg.text && <span className="message-text">&gt; {msg.type === 'deleted' ? `🚫 ${msg.text}` : msg.text}</span>}
                     {renderMessageContent(msg)}
                   </div>
                 );
@@ -1910,12 +1969,73 @@ function App() {
           </div>
         )}
 
+        {(replyTo || editingMsg) && (
+          <div className="composer-bar">
+            <span className="composer-bar-label">
+              {editingMsg ? '✎ Редактирование' : `↩ Ответ ${replyTo.username}`}
+            </span>
+            <span className="composer-bar-text">
+              {(editingMsg ? editingMsg.text : replyTo.text) || (replyTo?.type === 'sticker' ? '🎨 Стикер' : '📎 Файл')}
+            </span>
+            <button
+              type="button"
+              className="composer-bar-clear"
+              title="Отменить"
+              onClick={() => { setReplyTo(null); setEditingMsg(null); }}
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
+        {msgMenu && (
+          <div className="msg-menu-overlay" onClick={() => setMsgMenu(null)}>
+            <div className="msg-menu" onClick={(e) => e.stopPropagation()}>
+              <div className="msg-menu-preview">
+                <b>{msgMenu.username}</b>: {(msgMenu.text || '🎨 Стикер / 📎 Файл').slice(0, 90)}
+              </div>
+              {msgMenu.type !== 'deleted' && msgMenu.username !== 'System' && (
+                <button type="button" onClick={() => { setReplyTo(msgMenu); setEditingMsg(null); setMsgMenu(null); }}>
+                  ↩ Ответить
+                </button>
+              )}
+              {msgMenu.userId === user?.id
+                && !['deleted', 'file', 'sticker'].includes(msgMenu.type)
+                && msgMenu.username !== 'System' && (
+                <button
+                  type="button"
+                  onClick={() => { setEditingMsg(msgMenu); setReplyTo(null); setInputValue(msgMenu.text); setMsgMenu(null); }}
+                >
+                  ✎ Редактировать
+                </button>
+              )}
+              {msgMenu.userId === user?.id && msgMenu.type !== 'deleted' && msgMenu.username !== 'System' && (
+                <button
+                  type="button"
+                  className="danger"
+                  onClick={() => { wsRef.current?.send(JSON.stringify({ type: 'delete', messageId: msgMenu.id })); setMsgMenu(null); }}
+                >
+                  🗑 Удалить
+                </button>
+              )}
+              {msgMenu.text && (
+                <button
+                  type="button"
+                  onClick={() => { navigator.clipboard?.writeText(msgMenu.text).catch(() => {}); setMsgMenu(null); }}
+                >
+                  ⧉ Копировать
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         <form className="input-form" onSubmit={handleSendMessage}>
           <div className="input-prompt">&gt; {username}:</div>
           <input
             type="text"
             value={inputValue}
-            onChange={(e) => setInputValue(e.target.value)}
+            onChange={handleInputChange}
             placeholder={activeChat ? '_' : 'Сначала выберите чат'}
             className="input-field"
             disabled={!isConnected || isUploading || !activeChatId}

@@ -46,7 +46,9 @@ CREATE TABLE IF NOT EXISTS messages (
     file_url TEXT,
     file_name TEXT,
     file_size INTEGER,
-    file_type TEXT
+    file_type TEXT,
+    reply_to INTEGER NOT NULL DEFAULT 0,
+    edited INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id);
 

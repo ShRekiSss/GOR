@@ -89,7 +89,7 @@ export class Hub {
     }
 
     // Обычное сообщение из чата: сохранить + разослать всем.
-    if (data?.chatId) {
+    if (data?.chatId && data?.type !== 'typing' && data?.type !== 'edit' && data?.type !== 'delete') {
       const f = {
         chatId: Number(data.chatId) || 1,
         userId: s.userID,
@@ -103,9 +103,53 @@ export class Hub {
         fileName: data.fileName ?? '',
         fileSize: data.fileSize ?? 0,
         fileType: data.fileType ?? '',
+        replyTo: Number(data.replyTo) || 0,
       } as Frame;
       const saved = await saveAndBroadcast(this.env, f);
       this.broadcast(saved);
+      return;
+    }
+
+    // «X печатает…» — только событие, в БД не пишем.
+    if (data?.type === 'typing' && data?.chatId) {
+      this.broadcast({
+        type: 'typing',
+        chatId: Number(data.chatId) || 1,
+        userId: s.userID,
+        username: s.username,
+      } as any);
+      return;
+    }
+
+    // Редактирование: только автор может трогать своё. Текст и edited уходят всем.
+    if (data?.type === 'edit' && data?.messageId) {
+      const id = Number(data.messageId);
+      if (!Number.isInteger(id) || id <= 0) return;
+      const newText = String(data.text ?? '').slice(0, 4000);
+      if (!newText.trim()) return;
+      const upd = await this.env.DB.prepare(
+        'UPDATE messages SET text = ?, edited = 1 WHERE id = ? AND user_id = ? AND message_type != \'deleted\'',
+      ).bind(newText, id, s.userID).run();
+      if (!upd.meta.changes) return; // не своё/не найдено — молча
+      const row = await this.env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(id).first<any>();
+      if (row) this.broadcast({ ...frameFromRow(row), type: 'edit' } as any);
+      return;
+    }
+
+    // Удаление: строка остаётся надгробием (type='deleted'), рассылаем факт.
+    if (data?.type === 'delete' && data?.messageId) {
+      const id = Number(data.messageId);
+      if (!Number.isInteger(id) || id <= 0) return;
+      const upd = await this.env.DB.prepare(
+        `UPDATE messages SET text = 'Сообщение удалено', message_type = 'deleted',
+           sticker_id = '', sticker_url = '', sticker_pack = '',
+           file_url = '', file_name = '', file_size = 0, file_type = '', reply_to = 0
+         WHERE id = ? AND user_id = ?`,
+      ).bind(id, s.userID).run();
+      if (!upd.meta.changes) return;
+      const row = await this.env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(id).first<any>();
+      if (row) this.broadcast({ ...frameFromRow(row), type: 'delete' } as any);
+      return;
     }
   }
 
@@ -123,12 +167,13 @@ export async function saveAndBroadcast(env: Env, f: Frame): Promise<Frame> {
   const ts = f.timestamp || hhmmss();
   const ins = await env.DB.prepare(
     `INSERT INTO messages (chat_id, user_id, username, text, timestamp, message_type,
-      sticker_id, sticker_url, sticker_pack, file_url, file_name, file_size, file_type)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      sticker_id, sticker_url, sticker_pack, file_url, file_name, file_size, file_type, reply_to)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).bind(
     chatID, f.userId ?? 0, f.username ?? '', f.text ?? '', ts,
     f.type ?? '', f.stickerId ?? '', f.stickerUrl ?? '', f.stickerPack ?? '',
     f.fileUrl ?? '', f.fileName ?? '', f.fileSize ?? 0, f.fileType ?? '',
+    (f as any).replyTo || 0,
   ).run();
 
   const row = await env.DB.prepare('SELECT * FROM messages WHERE id = ?')
@@ -172,5 +217,7 @@ export function frameFromRow(r: any): Frame {
     fileName: r.file_name ?? '',
     fileSize: r.file_size ?? 0,
     fileType: r.file_type ?? '',
+    replyTo: r.reply_to ?? 0,
+    edited: r.edited ?? 0,
   };
 }

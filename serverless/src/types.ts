@@ -28,4 +28,6 @@ export interface Frame {
   fileName?: string;
   fileSize?: number;
   fileType?: string;
+  replyTo?: number;
+  edited?: number;
 }
