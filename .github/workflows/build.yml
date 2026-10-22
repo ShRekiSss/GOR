@@ -185,7 +185,18 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
+      # sdkmanager: используем предустановленный на ubuntu-latest SDK,
+      # android-actions/setup-android@v3 падает (sdkmanager tools → exit 1).
+      - name: Install Android NDK
+        run: |
+          set -e
+          SDK="$ANDROID_HOME"
+          echo "SDK root: $SDK"
+          sudo "$SDK/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;27.0.12077973" >/dev/null
+          yes | sudo "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          echo "NDK_HOME=$SDK/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$SDK/ndk/27.0.12077973" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
 
