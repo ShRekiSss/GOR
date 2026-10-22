@@ -1,11 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "VAKSA",
-<<<<<<< HEAD
-  "version": "0.9.1",
-=======
   "version": "1.0.0",
->>>>>>> 379e2c3 (feat(1.0.0): боевой сервер на Cloudflare (Workers+D1+DO) на vaksa.space; файлы чанками в D1 вместо R2; починка PBKDF2/атоб; взрослое окно входа/регистрации (табы, сила пароля, CapsLock, глазок); ROADMAP.md; README: адрес в облаке)
   "identifier": "com.gor.messenger",
   "build": {
     "frontendDist": "../../frontend/build"
