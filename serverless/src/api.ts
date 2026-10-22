@@ -1,0 +1,489 @@
+// REST API VAKSA — семантика 1:1 с main.go (коды, тексты ошибок, JSON-формы).
+
+import { Env, Frame } from './types';
+import {
+  User, USERNAME_RE, createSession, hashPassword, rateLimitAuth, tokenFromRequest, userByToken, verifyPassword,
+} from './auth';
+import { text } from './index';
+import { hhmmss, saveAndBroadcast, broadcastOnly } from './hub';
+
+function json(obj: unknown, status = 200): Response {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+  });
+}
+
+function hhmmss(): string {
+  // Как в GOR: серверное локальное времяdart, у нас UTC+7.
+  const d = new Date(Date.now() + 7 * 3600 * 1000);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
+export async function api(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const path = url.pathname;
+  const seg = path.split('/').filter(Boolean); // ['api', ...]
+
+  // ---------- health / stats ----------
+  if (path === '/api/health') {
+    return json({ status: 'ok', uptime: 'cloud', version: env.VERSION });
+  }
+  if (path === '/api/stats') {
+    const stub = env.HUB.get(env.HUB.idFromName('hub'));
+    const resp = await stub.fetch('https://hub/stats');
+    const online = (await resp.json()) as { online: number };
+    return json({ online: online.online ?? 0 });
+  }
+
+  // ---------- auth ----------
+  if (path === '/api/auth/register' || path === '/api/auth/login') {
+    const isRegister = path.endsWith('/register');
+    if (req.method !== 'POST') return text('Method not allowed', 405);
+
+    const ip = req.headers.get('CF-Connecting-IP') || 'unknown';
+    if (!(await rateLimitAuth(env, ip))) {
+      return text('Слишком много попыток, попробуйте позже', 429);
+    }
+
+    let creds: { username?: string; password?: string };
+    try {
+      creds = await req.json();
+    } catch {
+      return text('Некорректный запрос', 400);
+    }
+    const username = (creds.username || '').trim();
+    const password = creds.password || '';
+
+    if (isRegister) {
+      if (!USERNAME_RE.test(username)) return text('Имя: 3-32 символа, латиница, цифры, _ . -', 400);
+      if (password.length < 8) return text('Пароль должен быть не короче 8 символов', 400);
+      if (password.length > 256) return text('Пароль слишком длинный', 400);
+
+      const exists = await env.DB.prepare(
+        'SELECT id FROM users WHERE username = ? COLLATE NOCASE LIMIT 1',
+      ).bind(username).first();
+      if (exists) return text('Это имя уже занято', 409);
+
+      const hash = await hashPassword(password);
+      const ins = await env.DB.prepare(
+        'INSERT INTO users (username, password_hash) VALUES (?, ?)',
+      ).bind(username, hash).run();
+      const userID = ins.meta.last_row_id as number;
+      const user: User = { id: userID, username };
+
+      const token = await createSession(env, userID);
+      await ensureGeneralChat(env, userID);
+      return json({ token, user }, 201);
+    }
+
+    // login: время выравнивается тем, что в обоих случаях гоняем hash-проверку
+    const row = await env.DB.prepare(
+      'SELECT id, username, password_hash FROM users WHERE username = ? COLLATE NOCASE LIMIT 1',
+    ).bind(username).first<{ id: number; username: string; password_hash: string }>();
+
+    let user: User | null = null;
+    if (row) {
+      if (await verifyPassword(row.password_hash, password)) {
+        user = { id: row.id, username: row.username };
+      }
+    } else {
+      await verifyPassword('pbkdf2$sha256$i=25000$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=', password);
+    }
+    if (!user) return text('Неверное имя или пароль', 401);
+
+    await ensureGeneralChat(env, user.id);
+    const token = await createSession(env, user.id);
+    return json({ token, user }, 200);
+  }
+
+  if (path === '/api/auth/logout') {
+    if (req.method !== 'POST') return text('Method not allowed', 405);
+    const token = tokenFromRequest(req);
+    if (token) await env.DB.prepare('DELETE FROM sessions WHERE token = ?').bind(token).run();
+    return new Response(null, { status: 204 });
+  }
+
+  // /uploads/* сам разбирает авторизацию (Bearer / cookie / ?t= для <img> и <video>),
+  // остальное требует заголовок/cookie.
+  const isUploads = path.startsWith('/uploads/');
+  if (!isUploads && path !== '/api/download') {
+    const authUser = await userByToken(env, tokenFromRequest(req));
+    if (!authUser) return text('Не авторизован', 401);
+    return apiRest(req, env, authUser);
+  }
+  // Для /uploads/* и /api/download токен вычисляем здесь: Bearer/cookie либо ?t=.
+  const maybeToken =
+    tokenFromRequest(req) || new URL(req.url).searchParams.get('t') || '';
+  const mediaUser = maybeToken ? await userByToken(env, maybeToken) : null;
+  if (!mediaUser) return text('Не авторизован', 401);
+  return apiMedia(req, env, mediaUser);
+}
+
+// REST: всё, кроме выдачи файлов (тут user гарантированно есть).
+async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
+  const url = new URL(req.url);
+  const path = url.pathname;
+  const seg = path.split('/').filter(Boolean);
+
+  // ---------- me / users ----------
+  if (path === '/api/auth/me' && req.method === 'GET') {
+    return json({ user });
+  }
+
+  if (path === '/api/users' && req.method === 'GET') {
+    const q = (url.searchParams.get('q') || '').trim();
+    const pattern = `%${q}%`;
+    const rows = await env.DB.prepare(
+      'SELECT id, username FROM users WHERE id != ? AND username LIKE ? ORDER BY username LIMIT 20',
+    ).bind(user.id, pattern).all<User>();
+    return json({ users: rows.results || [] });
+  }
+
+  // ---------- chats ----------
+  if (path === '/api/chats') {
+    if (req.method === 'GET') return json({ chats: await listChats(env, user.id) });
+    if (req.method === 'POST') return createChat(req, env, user);
+    return text('Method not allowed', 405);
+  }
+
+  if (seg[0] === 'api' && seg[1] === 'chats' && seg.length === 4) {
+    const chatID = Number(seg[2]);
+    const sub = seg[3];
+    if (!Number.isInteger(chatID) || chatID <= 0) return text('Не найдено', 404);
+    if (!(await isMember(env, chatID, user.id))) return text('Нет доступа к чату', 403);
+
+    if (sub === 'messages' && req.method === 'GET') {
+      const messages = await getMessages(env, chatID, 100);
+      return json({ messages });
+    }
+    if (sub === 'read' && req.method === 'POST') {
+      let body: { messageId?: number };
+      try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
+      await env.DB.prepare(
+        'UPDATE chat_members SET last_read_message_id = MAX(last_read_message_id, ?) WHERE chat_id = ? AND user_id = ?',
+      ).bind(body.messageId || 0, chatID, user.id).run();
+      return new Response(null, { status: 204 });
+    }
+    return text('Не найдено', 404);
+  }
+
+  // ---------- messages (старый путь, массивом) ----------
+  if (path === '/api/messages' && req.method === 'GET') {
+    const chatID = Number(url.searchParams.get('chatId')) || 1;
+    if (!(await isMember(env, chatID, user.id))) return text('Нет доступа к чату', 403);
+    return json(await getMessages(env, chatID, 100));
+  }
+
+  // ---------- upload ----------
+  if (path === '/api/upload' && req.method === 'POST') {
+    return handleUpload(req, env, user);
+  }
+
+  return text('Не найдено', 404);
+}
+
+// Медиа: /uploads/<name> и /api/download — авторизация Bearer/cookie либо ?t=.
+async function apiMedia(req: Request, env: Env, user: User): Promise<Response> {
+  const url = new URL(req.url);
+  const path = url.pathname;
+
+  // ---------- download ----------
+  if (path === '/api/download') {
+    return uploadsRead(req, env, user, (url.searchParams.get('file') || '').split('/').pop() || '');
+  }
+
+  // ---------- раздача файлов /uploads/<name> ----------
+  if (path.startsWith('/uploads/')) {
+    const name = decodeURIComponent(path.slice('/uploads/'.length)).split('/').pop() || '';
+    return uploadsRead(req, env, user, name);
+  }
+
+  return text('Не найдено', 404);
+}
+
+// ---------- Хелперы чатов/сообщений ----------
+
+export async function ensureGeneralChat(env: Env, userID: number) {
+  await env.DB.prepare('INSERT OR IGNORE INTO chat_members (chat_id, user_id) VALUES (1, ?)')
+    .bind(userID).run();
+}
+
+export async function isMember(env: Env, chatID: number, userID: number): Promise<boolean> {
+  const row = await env.DB.prepare(
+    'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+  ).bind(chatID, userID).first();
+  return !!row;
+}
+
+export function frameFromRow(r: any): Frame {
+  return {
+    id: r.id,
+    chatId: Number(r.chat_id ?? 1),
+    userId: r.user_id ?? 0,
+    username: r.username ?? '',
+    text: r.text ?? '',
+    timestamp: r.timestamp ?? '',
+    type: r.message_type ?? '',
+    stickerId: r.sticker_id ?? '',
+    stickerUrl: r.sticker_url ?? '',
+    stickerPack: r.sticker_pack ?? '',
+    fileUrl: r.file_url ?? '',
+    fileName: r.file_name ?? '',
+    fileSize: r.file_size ?? 0,
+    fileType: r.file_type ?? '',
+  };
+}
+
+export async function getMessages(env: Env, chatID: number, limit: number): Promise<Frame[]> {
+  const rows = await env.DB.prepare(
+    `SELECT * FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?`,
+  ).bind(chatID, limit).all();
+  const out = (rows.results || []).map(frameFromRow);
+  out.reverse(); // старые сначала
+  return out;
+}
+
+export async function listChats(env: Env, userID: number) {
+  const rows = await env.DB.prepare(
+    `SELECT c.id, c.type, c.title, cm.last_read_message_id AS last_read
+     FROM chats c JOIN chat_members cm ON cm.chat_id = c.id
+     WHERE cm.user_id = ?`,
+  ).bind(userID).all<{ id: number; type: string; title: string; last_read: number }>();
+
+  const items: { chat: any; lastID: number }[] = [];
+  for (const r of rows.results || []) {
+    const chat: any = { id: r.id, type: r.type, title: r.title, unread: 0 };
+    let lastID = 0;
+    const last = await env.DB.prepare(
+      'SELECT id, text, username, timestamp FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT 1',
+    ).bind(r.id).first<any>();
+    if (last) {
+      lastID = last.id;
+      chat.lastText = last.text ?? '';
+      chat.lastSender = last.username ?? '';
+      chat.lastTime = last.timestamp ?? '';
+    }
+    const unreadRow = await env.DB.prepare(
+      'SELECT COUNT(*) AS n FROM messages WHERE chat_id = ? AND id > ? AND COALESCE(user_id, 0) != ?',
+    ).bind(r.id, r.last_read, userID).first<{ n: number }>();
+    chat.unread = unreadRow?.n || 0;
+
+    if (r.type === 'direct') {
+      const peer = await env.DB.prepare(
+        `SELECT u.id, u.username FROM chat_members cm JOIN users u ON u.id = cm.user_id
+         WHERE cm.chat_id = ? AND cm.user_id != ? LIMIT 1`,
+      ).bind(r.id, userID).first<any>();
+      if (peer) {
+        chat.peerId = peer.id;
+        chat.peer = peer.username;
+        chat.title = peer.username;
+      }
+    }
+    items.push({ chat, lastID });
+  }
+  // новые сверху (по последнему сообщению, как в GOR)
+  items.sort((a, b) => b.lastID - a.lastID);
+  return items.map((i) => i.chat);
+}
+
+async function createChat(req: Request, env: Env, user: User): Promise<Response> {
+  let body: { type?: string; username?: string; title?: string; usernames?: string[] };
+  try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
+
+  const findUser = async (name: string) => {
+    return env.DB.prepare('SELECT id, username FROM users WHERE username = ? COLLATE NOCASE LIMIT 1')
+      .bind(name.trim()).first<User>();
+  };
+
+  if (body.type === 'direct') {
+    const peer = await findUser(body.username || '');
+    if (!peer) return text('Пользователь не найден', 404);
+    if (peer.id === user.id) return text('Нельзя начать чат с самим собой', 400);
+
+    const dupe = await env.DB.prepare(
+      `SELECT cm1.chat_id AS id FROM chat_members cm1
+       JOIN chat_members cm2 ON cm2.chat_id = cm1.chat_id
+       JOIN chats c ON c.id = cm1.chat_id
+       WHERE c.type = 'direct' AND cm1.user_id = ? AND cm2.user_id = ? LIMIT 1`,
+    ).bind(user.id, peer.id).first<{ id: number }>();
+
+    let chatID: number;
+    if (dupe) {
+      chatID = dupe.id;
+    } else {
+      const ins = await env.DB.prepare(
+        "INSERT INTO chats (type, title, created_by) VALUES ('direct', '', ?)",
+      ).bind(user.id).run();
+      chatID = ins.meta.last_row_id as number;
+      await env.DB.prepare('INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?), (?, ?)')
+        .bind(chatID, user.id, chatID, peer.id).run();
+    }
+    const chats = await listChats(env, user.id);
+    const chat = chats.find((c) => c.id === chatID);
+    if (!chat) return text('Чат создан, но не найден', 500);
+    return json({ chat }, 201);
+  }
+
+  if (body.type === 'group') {
+    const title = (body.title || '').trim();
+    if (title.length < 1 || title.length > 64) return text('Название группы: от 1 до 64 символов', 400);
+    const names = body.usernames || [];
+    if (names.length === 0) return text('Добавьте хотя бы одного участника', 400);
+    if (names.length > 50) return text('Слишком много участников (максимум 50)', 400);
+
+    const ids: number[] = [];
+    for (const name of names) {
+      const member = await findUser(name);
+      if (!member) return text(`Пользователь "${name}" не найден`, 404);
+      ids.push(member.id);
+    }
+
+    const ins = await env.DB.prepare(
+      "INSERT INTO chats (type, title, created_by) VALUES ('group', ?, ?)",
+    ).bind(title, user.id).run();
+    const chatID = ins.meta.last_row_id as number;
+
+    const seen = new Set<number>([user.id]);
+    let q = 'INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)';
+    const binds: any[] = [chatID, user.id];
+    for (const id of ids) {
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      q += ', (?, ?)';
+      binds.push(chatID, id);
+    }
+    await env.DB.prepare(q).bind(...binds).run();
+
+    const chats = await listChats(env, user.id);
+    const chat = chats.find((c) => c.id === chatID);
+    if (!chat) return text('Группа создана, но не найдена', 500);
+    return json({ chat }, 201);
+  }
+
+  return text('Тип чата: direct или group', 400);
+}
+
+// ---------- Файлы ----------
+
+function fileTypeOf(name: string): string {
+  const ext = name.split('.').pop()?.toLowerCase() || '';
+  if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'].includes(ext)) return 'image';
+  if (['mp3', 'wav', 'ogg', 'flac', 'aac'].includes(ext)) return 'audio';
+  if (['mp4', 'webm', 'avi', 'mov', 'mkv'].includes(ext)) return 'video';
+  return 'document';
+}
+
+function safeUploadName(name: string): string {
+  name = (name || 'file').replace(/\\/g, '/').split('/').pop() || 'file';
+  // eslint-disable-next-line no-control-regex
+  name = name.replace(/[\x00-\x1f]/g, '');
+  if (!name || name === '.' || name === '..') name = 'file';
+  if (name.length > 128) {
+    const dot = name.lastIndexOf('.');
+    name = name.slice(0, 120) + (dot > 0 ? name.slice(dot) : '');
+  }
+  return name;
+}
+
+async function handleUpload(req: Request, env: Env, user: User): Promise<Response> {
+  const form = await req.formData().catch(() => null);
+  if (!form) return text('Некорректный запрос', 400);
+  const file = form.get('file');
+  if (!(file instanceof File)) return text('Failed to get file', 400);
+  if (file.size > 50 * 1024 * 1024) return text('File too large (max 50MB)', 400);
+
+  const chatID = Number(form.get('chatId')) || 1;
+  if (!(await isMember(env, chatID, user.id))) return text('Нет доступа к чату', 403);
+
+  const originalName = safeUploadName(file.name);
+  const key = `${Date.now()}${Math.floor(Math.random() * 1000)}_${originalName}`;
+
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  await putFileChunks(env, key, bytes, file.type || 'application/octet-stream');
+
+  const msg: any = {
+    chatId: chatID,
+    userId: user.id,
+    username: user.username,
+    text: '📎 Отправил файл',
+    type: 'file',
+    timestamp: hhmmss(),
+    fileUrl: `/uploads/${key}`,
+    fileName: originalName,
+    fileSize: file.size,
+    fileType: fileTypeOf(originalName),
+  };
+  await saveAndBroadcast(env, msg);
+
+  return json({
+    success: true,
+    fileUrl: msg.fileUrl,
+    fileName: msg.fileName,
+    fileSize: msg.fileSize,
+    fileType: msg.fileType,
+  });
+}
+
+// ---------- Хранение файлов в D1 чанками (замена R2) ----------
+
+const CHUNK_SIZE = 900 * 1024;
+
+export async function putFileChunks(env: Env, key: string, bytes: Uint8Array, contentType: string) {
+  const stmts: D1PreparedStatement[] = [];
+  for (let i = 0, seq = 0; i < bytes.length; i += CHUNK_SIZE, seq++) {
+    stmts.push(env.DB.prepare('INSERT INTO file_chunks (name, seq, data) VALUES (?, ?, ?)')
+      .bind(key, seq, bytes.subarray(i, i + CHUNK_SIZE)));
+  }
+  stmts.push(env.DB.prepare('INSERT INTO files (name, size, content_type) VALUES (?, ?, ?)')
+    .bind(key, bytes.length, contentType));
+  if (stmts.length > 1) {
+    await env.DB.batch(stmts);
+  } else {
+    for (const s of stmts) await s.run();
+  }
+}
+
+export async function getFileChunks(env: Env, key: string): Promise<{ bytes: Uint8Array; contentType: string } | null> {
+  const meta = await env.DB.prepare('SELECT size, content_type FROM files WHERE name = ?')
+    .bind(key).first<{ size: number; content_type: string }>();
+  if (!meta) return null;
+  const rows = await env.DB.prepare('SELECT data FROM file_chunks WHERE name = ? ORDER BY seq')
+    .bind(key).all<{ data: ArrayBuffer }>();
+  const chunks = (rows.results || []).map((r) => new Uint8Array(r.data));
+  const total = chunks.reduce((n, c) => n + c.byteLength, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+  return { bytes: out, contentType: meta.content_type };
+}
+
+async function uploadsRead(req: Request, env: Env, user: User, rawName: string): Promise<Response> {
+  // Медиа-теги не шлют заголовки: разрешаем ?t=<token> только здесь.
+  let token = tokenFromRequest(req);
+  if (!token) token = new URL(req.url).searchParams.get('t') || '';
+  const viewer = token ? await userByToken(env, token) : user;
+  if (!viewer) return text('Не авторизован', 401);
+
+  const name = rawName.replace(/\\/g, '/').split('/').pop() || '';
+  if (!name || name.includes('..')) return text('Не найдено', 404);
+
+  // Привязка к чату по сообщению с этим file_url.
+  const linked = await env.DB.prepare(
+    'SELECT COALESCE(chat_id, 1) AS chat_id FROM messages WHERE file_url = ? ORDER BY id LIMIT 1',
+  ).bind(`/uploads/${name}`).first<{ chat_id: number }>();
+
+  // Файл без привязки к сообщению — только участникам общего чата (как в GOR).
+  const chatID = linked ? Number(linked.chat_id) || 1 : 1;
+  if (!(await isMember(env, chatID, viewer.id))) return text('Нет доступа к файлу', 403);
+
+  const file = await getFileChunks(env, name);
+  if (!file) return text('Не найдено', 404);
+
+  const headers = new Headers();
+  headers.set('content-type', file.contentType || 'application/octet-stream');
+  headers.set('cache-control', 'private, max-age=3600');
+  headers.set('x-content-type-options', 'nosniff');
+  return new Response(file.bytes, { headers });
+}

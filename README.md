@@ -5,6 +5,14 @@
 
 ---
 
+## ☁️ Адрес живого сервера
+
+Сервер переехал в облако — **https://vaksa.space** (Cloudflare Workers + D1, без чьего-то ПК). Просто открой сайт или в приложении впиши `https://vaksa.space`.
+
+Проверка: `https://vaksa.space/api/health` → `{"status":"ok"}`.
+
+---
+
 ## 📲 Хочу поставить себе — **жми сюда 👉 [Releases](https://github.com/ShRekiSss/GOR/releases/latest)**
 
 Там лежат готовые файлы, качай под своё:

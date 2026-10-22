@@ -55,7 +55,9 @@ function App() {
   const [user, setUser] = useState(null);
   const [authChecking, setAuthChecking] = useState(true);
   const [authMode, setAuthMode] = useState('login');
-  const [authForm, setAuthForm] = useState({ username: '', password: '' });
+  const [authForm, setAuthForm] = useState({ username: '', password: '', pass2: '' });
+  const [authShowPass, setAuthShowPass] = useState(false);
+  const [authCaps, setAuthCaps] = useState(false);
   const [authError, setAuthError] = useState('');
   const [authBusy, setAuthBusy] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
@@ -925,6 +927,24 @@ function App() {
     e.preventDefault();
     if (authBusy) return;
 
+    // Валидация на клиенте — те же правила, что приняты сервером.
+    const username = authForm.username.trim();
+    const regex = /^[a-zA-Z0-9_.-]{3,32}$/;
+    if (!regex.test(username)) {
+      setAuthError('Имя: 3-32 символа, латиница, цифры, _ . -');
+      return;
+    }
+    if (authMode === 'register') {
+      if (authForm.password.length < 8) {
+        setAuthError('Пароль должен быть не короче 8 символов');
+        return;
+      }
+      if (authForm.password !== authForm.pass2) {
+        setAuthError('Пароли не совпадают');
+        return;
+      }
+    }
+
     setAuthBusy(true);
     setAuthError('');
 
@@ -934,7 +954,7 @@ function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          username: authForm.username.trim(),
+          username,
           password: authForm.password,
         }),
       });
@@ -947,7 +967,7 @@ function App() {
       const data = JSON.parse(text);
       setToken(data.token);
       setUser(data.user);
-      setAuthForm({ username: '', password: '' });
+      setAuthForm({ username: '', password: '', pass2: '' });
       setMessages([]);
       messagesSetRef.current.clear();
     } catch (error) {
@@ -1485,55 +1505,166 @@ function App() {
   }
 
   if (!user) {
+    const username = authForm.username.trim();
+    const usernameOk = /^[a-zA-Z0-9_.-]{3,32}$/.test(username);
+    const passOk = authForm.password.length >= 8;
+    const pass2Ok = authMode === 'login' || authForm.pass2 === authForm.password;
+    const canSubmit = usernameOk && passOk && pass2Ok && !authBusy;
+
+    // Силу пароля считаем честно: длина + классы символов.
+    let strength = 0;
+    if (authForm.password.length >= 8) strength += 34;
+    if (authForm.password.length >= 12) strength += 22;
+    if (/[0-9]/.test(authForm.password)) strength += 14;
+    if (/[a-zа-я]/.test(authForm.password) && /[A-ZА-Я]/.test(authForm.password)) strength += 16;
+    if (/[^a-zA-Z0-9а-яА-Я]/.test(authForm.password)) strength += 14;
+    const strengthLabel =
+      strength < 35 ? 'слабый' : strength < 70 ? 'нормальный' : 'крепкий';
+    const strengthClass =
+      strength < 35 ? 'weak' : strength < 70 ? 'mid' : 'good';
+
     return (
       <div className="setup-screen">
-        <form className="setup-card" onSubmit={handleAuthSubmit}>
-          <h1>VAKSA</h1>
-          <p className="setup-subtitle">
-            {authMode === 'login' ? 'Вход в аккаунт' : 'Создание аккаунта'}
-          </p>
+        <form className="setup-card auth-card" onSubmit={handleAuthSubmit}>
+          <div className="auth-brand">
+            <img className="auth-logo" src="/icons/icon-192.png" alt="VAKSA" />
+            <div className="auth-wordmark">VAKSA</div>
+            <div className="auth-tagline">
+              {authMode === 'login' ? 'С возвращением' : 'Добро пожаловать'}
+            </div>
+          </div>
 
-          <input
-            type="text"
-            className="setup-input"
-            value={authForm.username}
-            onChange={(e) => setAuthForm((prev) => ({ ...prev, username: e.target.value }))}
-            placeholder="Имя пользователя"
-            autoComplete="username"
-            autoFocus
-          />
-          <input
-            type="password"
-            className="setup-input"
-            value={authForm.password}
-            onChange={(e) => setAuthForm((prev) => ({ ...prev, password: e.target.value }))}
-            placeholder={authMode === 'login' ? 'Пароль' : 'Пароль (минимум 8 символов)'}
-            autoComplete={authMode === 'login' ? 'current-password' : 'new-password'}
-          />
+          <div className="auth-tabs">
+            <button
+              type="button"
+              className={`auth-tab ${authMode === 'login' ? 'active' : ''}`}
+              onClick={() => { setAuthMode('login'); setAuthError(''); }}
+            >
+              Вход
+            </button>
+            <button
+              type="button"
+              className={`auth-tab ${authMode === 'register' ? 'active' : ''}`}
+              onClick={() => { setAuthMode('register'); setAuthError(''); }}
+            >
+              Регистрация
+            </button>
+          </div>
 
-          {authError && <div className="setup-error">{authError}</div>}
+          <label className="auth-field">
+            <span className="auth-label">Имя пользователя</span>
+            <input
+              type="text"
+              className={`setup-input auth-input ${authMode === 'register' && username && !usernameOk ? 'invalid' : ''}`}
+              value={authForm.username}
+              onChange={(e) => setAuthForm((prev) => ({ ...prev, username: e.target.value }))}
+              placeholder="имя_на_латинице"
+              autoComplete="username"
+              autoFocus
+              maxLength={32}
+              spellCheck={false}
+            />
+            {authMode === 'register' && (
+              <span className={`auth-hint ${usernameOk ? 'ok' : username ? 'bad' : ''}`}>
+                {usernameOk
+                  ? 'Имя подходит'
+                  : username
+                  ? '3-32 символа: латиница, цифры, _ . -'
+                  : 'Латиница, цифры, _ . -'}
+              </span>
+            )}
+          </label>
 
-          <button type="submit" className="setup-button" disabled={authBusy}>
-            {authBusy ? '…' : authMode === 'login' ? 'ВОЙТИ' : 'СОЗДАТЬ АККАУНТ'}
+          <label className="auth-field">
+            <span className="auth-label">Пароль</span>
+            <div className="auth-passwrap">
+              <input
+                type={authShowPass ? 'text' : 'password'}
+                className={`setup-input auth-input ${authMode === 'register' && authForm.password && !passOk ? 'invalid' : ''}`}
+                value={authForm.password}
+                onChange={(e) => setAuthForm((prev) => ({ ...prev, password: e.target.value }))}
+                onKeyUp={(e) => setAuthCaps(!!e.getModifierState && e.getModifierState('CapsLock'))}
+                placeholder={authMode === 'login' ? 'Пароль' : 'Минимум 8 символов'}
+                autoComplete={authMode === 'login' ? 'current-password' : 'new-password'}
+              />
+              <button
+                type="button"
+                className="auth-eye"
+                onClick={() => setAuthShowPass((v) => !v)}
+                title={authShowPass ? 'Скрыть пароль' : 'Показать пароль'}
+                aria-label={authShowPass ? 'Скрыть пароль' : 'Показать пароль'}
+              >
+                {authShowPass ? '🙈' : '👁'}
+              </button>
+            </div>
+
+            {authCaps && (
+              <span className="auth-caps">⚠️ Включён Caps Lock</span>
+            )}
+
+            {authMode === 'register' && (
+              <>
+                {authForm.password && (
+                  <div className={`auth-strength ${strengthClass}`}>
+                    <div className="auth-strength-bar" />
+                    <span>Пароль {strengthLabel}</span>
+                  </div>
+                )}
+                <input
+                  type={authShowPass ? 'text' : 'password'}
+                  className={`setup-input auth-input ${authForm.pass2 && !pass2Ok ? 'invalid' : ''}`}
+                  value={authForm.pass2}
+                  onChange={(e) => setAuthForm((prev) => ({ ...prev, pass2: e.target.value }))}
+                  placeholder="Повторите пароль"
+                  autoComplete="new-password"
+                />
+                <span className={`auth-hint ${pass2Ok ? 'ok' : authForm.pass2 ? 'bad' : ''}`}>
+                  {authForm.pass2 && !pass2Ok ? 'Пароли не совпадают' : ' '}
+                </span>
+              </>
+            )}
+          </label>
+
+          {authError && (
+            <div className="auth-error" role="alert">
+              {authError}
+            </div>
+          )}
+
+          <button type="submit" className="setup-button auth-submit" disabled={!canSubmit}>
+            {authBusy ? (
+              <span className="auth-spinner" aria-label="Подождите" />
+            ) : authMode === 'login' ? (
+              'Войти'
+            ) : (
+              'Создать аккаунт'
+            )}
           </button>
 
-          <button
-            type="button"
-            className="auth-switch"
-            onClick={() => {
-              setAuthMode((mode) => (mode === 'login' ? 'register' : 'login'));
-              setAuthError('');
-            }}
-          >
-            {authMode === 'login'
-              ? 'Нет аккаунта? Зарегистрироваться'
-              : 'Уже есть аккаунт? Войти'}
-          </button>
+          <div className="auth-switch-row">
+            {authMode === 'login' ? (
+              <button
+                type="button"
+                className="auth-switch"
+                onClick={() => { setAuthMode('register'); setAuthError(''); }}
+              >
+                Нет аккаунта? Регистрация
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="auth-switch"
+                onClick={() => { setAuthMode('login'); setAuthError(''); }}
+              >
+                Уже есть аккаунт? Войти
+              </button>
+            )}
+          </div>
 
           {isDesktop() && (
             <button
               type="button"
-              className="auth-switch"
+              className="auth-switch auth-serverlink"
               onClick={() => setShowServerSetup(true)}
             >
               Сменить сервер: {server}
