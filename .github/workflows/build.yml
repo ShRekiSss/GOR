@@ -22,7 +22,7 @@ jobs:
       - name: Build frontend
         working-directory: frontend
         run: |
-          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
           npm run build
 
       - uses: actions/setup-go@v5
@@ -60,7 +60,7 @@ jobs:
         working-directory: frontend
         shell: bash
         run: |
-          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
           npm run build
 
       - uses: actions/setup-go@v5
@@ -101,7 +101,7 @@ jobs:
         working-directory: frontend
         shell: bash
         run: |
-          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
           npm run build
 
       - uses: dtolnay/rust-toolchain@stable
@@ -114,7 +114,7 @@ jobs:
         working-directory: desktop
         shell: bash
         run: |
-          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
           npx tauri build
 
       - uses: actions/upload-artifact@v4
@@ -147,7 +147,7 @@ jobs:
       - name: Build frontend
         working-directory: frontend
         run: |
-          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
           npm run build
 
       - uses: dtolnay/rust-toolchain@stable
@@ -159,7 +159,7 @@ jobs:
       - name: Build desktop app (AppImage + deb)
         working-directory: desktop
         run: |
-          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
           npx tauri build
 
       - uses: actions/upload-artifact@v4
@@ -199,13 +199,13 @@ jobs:
       - name: Build frontend
         working-directory: frontend
         run: |
-          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
           npm run build
 
       - name: Build APK (universal, 4 ABI)
         working-directory: desktop
         run: |
-          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
           npx tauri android init --ci
           bash patch-android-permissions.sh
           # Если секреты подписи заданы — релизная подпись; иначе debug-APK (ставится на любую телефон)
