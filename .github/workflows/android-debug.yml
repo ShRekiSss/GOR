@@ -1,0 +1,68 @@
+name: android-debug
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android NDK
+        run: |
+          set -e
+          SDK="$ANDROID_HOME"
+          sudo "$SDK/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;27.0.12077973" >/dev/null
+          yes | sudo "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          echo "NDK_HOME=$SDK/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust targets
+        run: rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm install -g npm@11 >/dev/null 2>&1
+          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npm run build
+
+      - name: Init android + diag gradle
+        working-directory: desktop
+        run: |
+          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          export ANDROID_USER_HOME="$RUNNER_TEMP/android-user-home"
+          npx tauri android init --ci
+          bash patch-android-permissions.sh
+          printf '\norg.gradle.configuration-cache=false\n' >> src-tauri/gen/android/gradle.properties
+          # Диагностика: пусть gradle сам расскажет, где боль
+          cd src-tauri/gen/android
+          (./gradlew :app:assembleUniversalDebug --stacktrace --info 2>&1 | tee "${{ github.workspace }}/gradle-diag.log") || true
+          # Печать ключевых делений прямо в лог
+          grep -nE "Caused by|Exception" "$PWD/../../gradle-diag.log" | head -60 || true
+          mkdir -p /home/runner/.config/.android 2>/dev/null; ls -ld /home/runner/.config/.android || true
+          ls -ld "$HOME/.config" "$HOME/.config/.android" || true
+          id; echo HOME=$HOME
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gradle-diag
+          path: gradle-diag.log
+          if-no-files-found: warn
