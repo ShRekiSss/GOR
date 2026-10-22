@@ -2004,7 +2004,13 @@ function App() {
                 && msgMenu.username !== 'System' && (
                 <button
                   type="button"
-                  onClick={() => { setEditingMsg(msgMenu); setReplyTo(null); setInputValue(msgMenu.text); setMsgMenu(null); }}
+                  onClick={() => {
+                    setEditingMsg(msgMenu);
+                    setReplyTo(null);
+                    setInputValue(msgMenu.text);
+                    setMsgMenu(null);
+                    showToast('Так и отправится — можешь переписать текст');
+                  }}
                 >
                   ✎ Редактировать
                 </button>
@@ -2013,7 +2019,11 @@ function App() {
                 <button
                   type="button"
                   className="danger"
-                  onClick={() => { wsRef.current?.send(JSON.stringify({ type: 'delete', messageId: msgMenu.id })); setMsgMenu(null); }}
+                  onClick={() => {
+                    wsRef.current?.send(JSON.stringify({ type: 'delete', messageId: msgMenu.id }));
+                    setMsgMenu(null);
+                    showToast('Сообщение удалено везде');
+                  }}
                 >
                   🗑 Удалить
                 </button>
