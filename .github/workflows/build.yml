@@ -169,9 +169,66 @@ jobs:
             desktop/src-tauri/target/release/bundle/appimage/*.AppImage
             desktop/src-tauri/target/release/bundle/deb/*.deb
 
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust targets for Android
+        run: rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npm run build
+
+      - name: Build APK (universal, 4 ABI)
+        working-directory: desktop
+        run: |
+          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npx tauri android init --ci
+          bash patch-android-permissions.sh
+          # Если секреты подписи заданы — релизная подпись; иначе debug-APK (ставится на любую телефон)
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > src-tauri/release.jks
+            export TAURI_ANDROID_KEYSTORE_PATH=$PWD/src-tauri/release.jks
+            export TAURI_ANDROID_KEYSTORE_PASSWORD="${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
+            export TAURI_ANDROID_KEY_ALIAS="${{ secrets.ANDROID_KEY_ALIAS }}"
+            export TAURI_ANDROID_KEY_PASSWORD="${{ secrets.ANDROID_KEY_PASSWORD }}"
+            npx tauri android build --ci --apk
+          else
+            npx tauri android build --ci --apk --debug
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gor-android-apk
+          path: |
+            desktop/src-tauri/gen/android/app/build/outputs/apk/universal/*.apk
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, windows, desktop-windows, desktop-linux]
+    needs: [linux, windows, desktop-windows, desktop-linux, android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -179,6 +236,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      - name: Collect APK
+        run: |
+          mkdir -p artifacts/apk
+          for f in artifacts/gor-android-apk/*.apk; do
+            if [ -e "$f" ]; then cp "$f" artifacts/apk/; fi
+          done
+          ls -la artifacts/apk
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -189,5 +254,6 @@ jobs:
             artifacts/gor-desktop-windows/**/*.msi
             artifacts/gor-desktop-linux/**/*.AppImage
             artifacts/gor-desktop-linux/**/*.deb
+            artifacts/apk/*.apk
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, '-') }}

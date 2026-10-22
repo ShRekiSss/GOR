@@ -14,6 +14,41 @@ import { authFetch, clearToken, getToken, setToken } from './auth';
 // Порог мобильной (Android/PWA) раскладки — совпадает с CSS @media.
 const MOBILE_MQ = '(max-width: 820px)';
 
+// --- Время сообщений ---
+// Новый формат — ISO UTC от сервера ("2026-10-22T09:41:00Z"):
+// сегодня → «12:41», вчера → «вчера 12:41», иначе «22.10, 12:41» — в локальном времени.
+// Старые записи (только «12:41:02») показываем как есть.
+function parseTs(ts) {
+  if (!ts || typeof ts !== 'string') return null;
+  if (ts.indexOf('T') === -1 && ts.indexOf('Z') === -1) return null;
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return null;
+  return date;
+}
+
+function localTime(ts) {
+  const date = parseTs(ts);
+  if (!date) return ts || '';
+  const hm = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const now = new Date();
+  if (date.toDateString() === now.toDateString()) return hm;
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return `вчера ${hm}`;
+  return `${date.toLocaleDateString([], { day: '2-digit', month: '2-digit' })}, ${hm}`;
+}
+
+function dayKey(date) {
+  return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+}
+
+function dayLabel(date) {
+  const now = new Date();
+  if (dayKey(date) === dayKey(now)) return 'Сегодня';
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  if (dayKey(date) === dayKey(yesterday)) return 'Вчера';
+  return date.toLocaleDateString([], { day: '2-digit', month: '2-digit', year: 'numeric' });
+}
+
 function App() {
   const [messages, setMessages] = useState([]);
   const [inputValue, setInputValue] = useState('');
@@ -44,9 +79,24 @@ function App() {
   const wsRef = useRef(null);
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
+  const messagesContainerRef = useRef(null);
   const messagesSetRef = useRef(new Set()); // Track message IDs to avoid duplicates
   const activeChatRef = useRef(null);
   const chatsRef = useRef([]);
+
+  // Пагинация «вглубь истории» и догон после реконнекта (Android рвёт WS в фоне).
+  const oldestIdRef = useRef(0); // id первого (самого старого) загруженного сообщения
+  const lastIdRef = useRef(0); // id последнего загруженного сообщения чата
+  const loadingOlderRef = useRef(false);
+  const canLoadOlderRef = useRef(false);
+  const skipScrollRef = useRef(false);
+  const viewportRef = useRef(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [canLoadOlder, setCanLoadOlder] = useState(false);
+  const setCanLoadOlderBoth = (value) => {
+    canLoadOlderRef.current = value;
+    setCanLoadOlder(value);
+  };
 
   const [chats, setChats] = useState([]);
   const [activeChatId, setActiveChatId] = useState(null);
@@ -84,9 +134,36 @@ function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
-  const GIPHY_API_KEY = process.env.REACT_APP_GIPHY_API_KEY || 'dc6zaTOxFJmzC';
   const username = user ? user.username : '';
   const activeChat = chats.find((chat) => chat.id === activeChatId) || null;
+
+  // Догон пропущенных сообщений активного чата после реконнекта WS.
+  const catchUpRef = useRef(null);
+  catchUpRef.current = async (chatId) => {
+    if (!chatId) return;
+    try {
+      const response = await authFetch(`/api/chats/${chatId}/messages?after=${lastIdRef.current}`);
+      if (!response.ok) return;
+      const data = await response.json();
+      const fresh = data.messages || [];
+      if (!fresh.length) return;
+      const freshKeys = fresh.filter((m) => m.id && !messagesSetRef.current.has(`${m.chatId}-${m.id}`));
+      freshKeys.forEach((m) => messagesSetRef.current.add(`${m.chatId}-${m.id}`));
+      if (freshKeys.length) {
+        skipScrollRef.current = true;
+        setMessages((prev) => [...prev, ...freshKeys]);
+      }
+      const last = fresh[fresh.length - 1];
+      if (last?.id) {
+        lastIdRef.current = Math.max(lastIdRef.current, last.id);
+        if (activeChatRef.current === chatId) {
+          markRead(chatId, last.id);
+        }
+      }
+    } catch (error) {
+      console.error('catch up messages:', error);
+    }
+  };
 
   const loadChats = useCallback(async (selectId) => {
     setChatsLoading(true);
@@ -211,8 +288,44 @@ function App() {
   }, [server]);
 
   useEffect(() => {
-    scrollToBottom();
+    // После вставки «старых» сообщений в начало не прыгаем вниз —
+    // возвращаем пользователю тот же кусок истории, что он смотрел.
+    if (skipScrollRef.current) {
+      skipScrollRef.current = false;
+      const container = messagesContainerRef.current;
+      if (container && viewportRef.current != null) {
+        container.scrollTop = container.scrollHeight - viewportRef.current;
+        viewportRef.current = null;
+        return;
+      }
+    }
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  // Сообщения с разделителями дней (Сегодня / Вчера / дата), как в мессенджерах.
+  const renderedMessages = [];
+  if (messages.length) {
+    let lastDay = null;
+    let fallbackKey = 0;
+    messages.forEach((msg) => {
+      const date = parseTs(msg.timestamp);
+      if (date) {
+        const key = dayKey(date);
+        if (key !== lastDay) {
+          lastDay = key;
+          renderedMessages.push({
+            divider: true,
+            label: dayLabel(date),
+            key: `day-${msg.chatId || activeChatId || 1}-${msg.id || (msg.timestamp || '')}`,
+          });
+        }
+      } else if (lastDay !== null) {
+        lastDay = null; // после современных сообщений старые (время без даты) отдельно
+      }
+      fallbackKey += 1;
+      renderedMessages.push({ divider: false, msg, key: fallbackKey });
+    });
+  }
 
   useEffect(() => {
     // Без входа и без адреса сервера подключаться некуда.
@@ -220,85 +333,126 @@ function App() {
       return undefined;
     }
 
-    const ws = new WebSocket(serverWsUrl(getToken()));
+    let closed = false;
+    let retry = 0;
+    let reconnectTimer = null;
+    let connectedOnce = false;
 
-    ws.onopen = () => {
-      // Авторизация первым кадром — токен не светится в URL/логах прокси.
-      ws.send(JSON.stringify({ type: 'auth', token: getToken() }));
-    };
+    const connect = () => {
+      if (closed) return;
+      const ws = new WebSocket(serverWsUrl());
+      wsRef.current = ws;
 
-    ws.onmessage = (event) => {
-      const message = JSON.parse(event.data);
+      ws.onopen = () => {
+        // Авторизация первым кадром — токен не светится в URL/логах прокси.
+        ws.send(JSON.stringify({ type: 'auth', token: getToken() }));
+      };
 
-      if (message.type === 'auth_ok') {
-        console.log('WS авторизован');
-        setIsConnected(true);
-        return;
-      }
-      if (message.type === 'auth_error') {
-        console.warn('WS: токен отклонён');
+      ws.onmessage = (event) => {
+        const incoming = JSON.parse(event.data);
+
+        if (incoming.type === 'auth_ok') {
+          console.log('WS авторизован');
+          setIsConnected(true);
+          if (connectedOnce) {
+            // Реконнект (Android рвёт сокет при уходе приложения в фон):
+            // дотягиваем пропущенные сообщения и обновляем список чатов.
+            retry = 0;
+            loadChats();
+            catchUpRef.current?.(activeChatRef.current);
+          }
+          connectedOnce = true;
+          return;
+        }
+        if (incoming.type === 'auth_error') {
+          console.warn('WS: токен отклонён');
+          setIsConnected(false);
+          return;
+        }
+        if (incoming.type === 'presence') {
+          // Вход/выход пользователей — событие, не сообщение в чат.
+          if (typeof incoming.online === 'number') {
+            setOnlineCount(incoming.online);
+          }
+          return;
+        }
+
+        const message = incoming;
+        if (!message.chatId) {
+          message.chatId = 1;
+        }
+
+        const isActive = message.chatId === activeChatRef.current;
+
+        if (isActive) {
+          const messageKey = message.id
+            ? `${message.chatId}-${message.id}`
+            : `${message.chatId}-${message.timestamp}-${message.username}-${message.text}`;
+          if (!messagesSetRef.current.has(messageKey)) {
+            messagesSetRef.current.add(messageKey);
+            setMessages((prev) => [...prev, message]);
+            if (message.id) {
+              lastIdRef.current = Math.max(lastIdRef.current, message.id);
+            }
+          }
+          if (message.userId !== user.id && message.id) {
+            markRead(message.chatId, message.id);
+          }
+        }
+
+        setChats((prev) => {
+          const index = prev.findIndex((chat) => chat.id === message.chatId);
+          if (index === -1) {
+            return prev;
+          }
+          const current = prev[index];
+          const updated = {
+            ...current,
+            lastText: message.text,
+            lastSender: message.username,
+            lastTime: message.timestamp || current.lastTime,
+            unread: isActive
+              ? 0
+              : (message.userId === user.id ? current.unread : (current.unread || 0) + 1),
+          };
+          const rest = prev.filter((_, i) => i !== index);
+          return [updated, ...rest];
+        });
+
+        if (!chatsRef.current.some((chat) => chat.id === message.chatId)) {
+          loadChats();
+        }
+
+        if (!isActive || document.hidden) {
+          notify(message);
+        }
+      };
+
+      ws.onclose = () => {
+        console.log('Disconnected from WebSocket');
         setIsConnected(false);
-        return;
-      }
-      if (!message.chatId) {
-        message.chatId = 1;
-      }
+        if (closed) return;
+        // Реконнект с нарастающей паузой: 0.5 c, 1 c, 2 c, 4 c … максимум 10 c.
+        const delay = Math.min(10000, 500 * (2 ** retry));
+        retry = Math.min(retry + 1, 5);
+        reconnectTimer = setTimeout(connect, delay);
+      };
 
-      const isActive = message.chatId === activeChatRef.current;
-
-      if (isActive) {
-        const messageKey = `${message.chatId}-${message.id || message.timestamp}-${message.username}-${message.text}`;
-        if (!messagesSetRef.current.has(messageKey)) {
-          messagesSetRef.current.add(messageKey);
-          setMessages((prev) => [...prev, message]);
-        }
-        if (message.userId !== user.id && message.id) {
-          markRead(message.chatId, message.id);
-        }
-      }
-
-      setChats((prev) => {
-        const index = prev.findIndex((chat) => chat.id === message.chatId);
-        if (index === -1) {
-          return prev;
-        }
-        const current = prev[index];
-        const updated = {
-          ...current,
-          lastText: message.text,
-          lastSender: message.username,
-          lastTime: message.timestamp,
-          unread: isActive
-            ? 0
-            : (message.userId === user.id ? current.unread : (current.unread || 0) + 1),
-        };
-        const rest = prev.filter((_, i) => i !== index);
-        return [updated, ...rest];
-      });
-
-      if (!chatsRef.current.some((chat) => chat.id === message.chatId)) {
-        loadChats();
-      }
-
-      if ((!isActive || document.hidden) && message.username !== 'System') {
-        notify(message);
-      }
+      ws.onerror = (error) => {
+        console.error('WebSocket error:', error);
+      };
     };
 
-    ws.onclose = () => {
-      console.log('Disconnected from WebSocket');
-      setIsConnected(false);
-    };
-
-    ws.onerror = (error) => {
-      console.error('WebSocket error:', error);
-    };
-
-    wsRef.current = ws;
+    connect();
 
     return () => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.close();
+      closed = true;
+      clearTimeout(reconnectTimer);
+      const ws = wsRef.current;
+      if (ws) {
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+          ws.close();
+        }
       }
     };
   }, [user, server, markRead, notify, loadChats]);
@@ -319,7 +473,7 @@ function App() {
     };
 
     fetchStats();
-    const interval = setInterval(fetchStats, 2000);
+    const interval = setInterval(fetchStats, 10000); // онлайны приходят и через WS presence
     return () => clearInterval(interval);
   }, [user, server]);
 
@@ -350,6 +504,8 @@ function App() {
     const load = async () => {
       setMessages([]);
       messagesSetRef.current = new Set();
+      skipScrollRef.current = false;
+      viewportRef.current = null;
       try {
         const response = await authFetch(`/api/chats/${activeChatId}/messages`);
         if (!response.ok) {
@@ -361,7 +517,10 @@ function App() {
         }
         const list = data.messages || [];
         setMessages(list);
-        messagesSetRef.current = new Set(list.map((m) => `${m.chatId}-${m.id}`));
+        messagesSetRef.current = new Set(list.filter((m) => m.id).map((m) => `${m.chatId}-${m.id}`));
+        oldestIdRef.current = list.length ? list[0].id : 0;
+        lastIdRef.current = list.length ? list[list.length - 1].id : 0;
+        setCanLoadOlderBoth(typeof data.hasMore === 'boolean' ? data.hasMore : list.length >= 100);
         if (list.length) {
           markRead(activeChatId, list[list.length - 1].id);
         }
@@ -375,6 +534,48 @@ function App() {
       cancelled = true;
     };
   }, [user, activeChatId, markRead]);
+
+  // Дозагрузка «старой» истории: тянем страницу сообщений перед самым старым
+  // загруженным и сохраняем положение экрана при прокрутке (Android/PWA-жест).
+  const loadOlder = async () => {
+    const chatId = activeChatRef.current;
+    const container = messagesContainerRef.current;
+    if (!chatId || !container) return;
+    if (loadingOlderRef.current || !canLoadOlderRef.current || !oldestIdRef.current) return;
+    loadingOlderRef.current = true;
+    setLoadingOlder(true);
+    try {
+      const response = await authFetch(`/api/chats/${chatId}/messages?before=${oldestIdRef.current}&limit=100`);
+      if (!response.ok) return;
+      const data = await response.json();
+      const older = data.messages || [];
+      if (!older.length) {
+        setCanLoadOlderBoth(false);
+        return;
+      }
+      older.forEach((m) => {
+        if (m.id) messagesSetRef.current.add(`${m.chatId}-${m.id}`);
+      });
+      // запоминаем, что сейчас видно, чтобы после вставки оставаться на месте
+      skipScrollRef.current = true;
+      viewportRef.current = container.scrollHeight - container.scrollTop;
+      oldestIdRef.current = older[0].id;
+      setCanLoadOlderBoth(typeof data.hasMore === 'boolean' ? data.hasMore : older.length >= 100);
+      setMessages((prev) => [...older, ...prev]);
+    } catch (error) {
+      console.error('load older:', error);
+    } finally {
+      loadingOlderRef.current = false;
+      setLoadingOlder(false);
+    }
+  };
+
+  const onMessagesScroll = () => {
+    const container = messagesContainerRef.current;
+    if (container && container.scrollTop < 60) {
+      loadOlder();
+    }
+  };
 
   // Поиск пользователей для нового чата.
   useEffect(() => {
@@ -498,7 +699,6 @@ function App() {
       chatId: activeChatId,
       username: username,
       text: inputValue,
-      timestamp: new Date().toLocaleTimeString(),
       type: 'text',
     };
 
@@ -520,7 +720,6 @@ function App() {
       chatId: activeChatId,
       username: username,
       text: '🎨 Sticker',
-      timestamp: new Date().toLocaleTimeString(),
       type: 'sticker',
       stickerId: sticker.id,
       stickerUrl: stickerUrl,
@@ -543,24 +742,15 @@ function App() {
     setGiphyResults([]);
 
     try {
-      const response = await fetch(
-        `https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_API_KEY}&q=${encodeURIComponent(
-          giphyQuery,
-        )}&limit=12&rating=pg-13`,
-      );
+      // Поиск через свой сервер: ключ GIPHY живёт в GOR_GIPHY_KEY на сервере.
+      const response = await authFetch(`/api/giphy?q=${encodeURIComponent(giphyQuery)}`);
 
+      const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error('GIPHY search failed');
+        throw new Error(data.error || 'GIPHY search failed');
       }
 
-      const data = await response.json();
-      setGiphyResults(
-        (data.data || []).map((item) => ({
-          id: item.id,
-          url: item.images.fixed_width_downsampled.url,
-          title: item.title,
-        })),
-      );
+      setGiphyResults(data.data || []);
     } catch (error) {
       console.error('GIPHY error:', error);
       setGiphyError('Не удалось загрузить GIF. Попробуйте позже.');
@@ -1406,7 +1596,7 @@ function App() {
                 <span className="chat-item-title">
                   {chat.type === 'group' ? '# ' : '@ '}{chat.title || chat.peer || 'Чат'}
                 </span>
-                {chat.lastTime && <span className="chat-item-time">{chat.lastTime.slice(0, 5)}</span>}
+                {chat.lastTime && <span className="chat-item-time">{localTime(chat.lastTime)}</span>}
               </div>
               <div className="chat-item-bottom">
                 <span className="chat-item-preview">
@@ -1468,6 +1658,8 @@ function App() {
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
+          ref={messagesContainerRef}
+          onScroll={onMessagesScroll}
         >
           {!activeChat && (
             <div className="welcome-message">
@@ -1483,24 +1675,34 @@ function App() {
               &gt; Напишите первое сообщение
             </div>
           )}
-          {messages.map((msg, idx) => (
-            <div
-              key={`${msg.chatId}-${msg.id}-${idx}`}
-              className={`message ${msg.username === 'System' ? 'system' : 'user'} ${msg.userId && user && msg.userId === user.id ? 'own' : ''}`}
-              onPointerDown={startMsgPress(msg)}
-              onPointerUp={cancelLongPress}
-              onPointerLeave={cancelLongPress}
-              onContextMenu={onMsgContext(msg)}
-              title="Долгое нажатие — копировать"
-            >
-              <div className="msg-head">
-                <span className="msg-avatar">{(msg.username?.[0] || '?').toUpperCase()}</span>
-                <span className="username-label">[{msg.username}]</span>
-                <span className="timestamp">{msg.timestamp}</span>
-              </div>
-              {msg.text && <span className="message-text">&gt; {msg.text}</span>}
-              {renderMessageContent(msg)}
-            </div>
+          {loadingOlder && <div className="history-loading">загрузка истории…</div>}
+          {renderedMessages.map((row) => (
+            row.divider ? (
+              <div key={row.key} className="day-divider"><span>{row.label}</span></div>
+            ) : (
+              (() => {
+                const msg = row.msg;
+                return (
+                  <div
+                    key={`${msg.chatId}-${msg.id}-${row.key}`}
+                    className={`message ${msg.username === 'System' ? 'system' : 'user'} ${msg.userId && user && msg.userId === user.id ? 'own' : ''}`}
+                    onPointerDown={startMsgPress(msg)}
+                    onPointerUp={cancelLongPress}
+                    onPointerLeave={cancelLongPress}
+                    onContextMenu={onMsgContext(msg)}
+                    title="Долгое нажатие — копировать"
+                  >
+                    <div className="msg-head">
+                      <span className="msg-avatar">{(msg.username?.[0] || '?').toUpperCase()}</span>
+                      <span className="username-label">[{msg.username}]</span>
+                      <span className="timestamp">{localTime(msg.timestamp)}</span>
+                    </div>
+                    {msg.text && <span className="message-text">&gt; {msg.text}</span>}
+                    {renderMessageContent(msg)}
+                  </div>
+                );
+              })()
+            )
           ))}
           <div ref={messagesEndRef} />
         </div>

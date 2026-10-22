@@ -1,5 +1,5 @@
 /* VAKSA service worker: кэш оболочки приложения, API и WS всегда из сети. */
-const CACHE = 'vaksa-pwa-v1';
+const CACHE = 'vaksa-pwa-v2';
 const CORE = ['/', '/index.html', '/manifest.json'];
 
 self.addEventListener('install', (event) => {
@@ -35,6 +35,28 @@ self.addEventListener('fetch', (event) => {
   if (url.pathname.startsWith('/uploads/')) return;
   if (url.pathname.startsWith('/ws')) return;
 
+  // Shell (index.html) — network-first: после пересборки сервера клиент
+  // получает новый бандл и хэши, без чистки «Данных сайта» на Android.
+  if (request.mode === 'navigate' || url.pathname === '/' || url.pathname === '/index.html') {
+    event.respondWith(
+      fetch(request)
+        .then((response) => {
+          const copy = response.clone();
+          caches.open(CACHE).then((cache) => {
+            cache.put('/index.html', copy);
+            cache.put('/', copy);
+          });
+          return response;
+        })
+        .catch(() =>
+          caches.match('/index.html').then((cached) => cached || caches.match('/'))
+        )
+    );
+    return;
+  }
+
+  // Хэшированные ресурсы /static/, стикеры, иконки — cache-first (офлайн-оболочка),
+  // с фоновым обновлением кэша свежим ответом.
   event.respondWith(
     caches.open(CACHE).then((cache) =>
       cache.match(request).then((cached) => {
@@ -45,9 +67,8 @@ self.addEventListener('fetch', (event) => {
               response.type === 'basic' &&
               (url.pathname.startsWith('/static/') ||
                 url.pathname.startsWith('/stickers/') ||
+                url.pathname.startsWith('/fonts/') ||
                 url.pathname.startsWith('/icons/') ||
-                url.pathname === '/' ||
-                url.pathname === '/index.html' ||
                 url.pathname === '/manifest.json');
             if (cacheable) {
               cache.put(request, response.clone());
@@ -55,6 +76,7 @@ self.addEventListener('fetch', (event) => {
             return response;
           })
           .catch(() => cached);
+        // Отдаём кэш мгновенно, сеть обновляет кэш в фоне.
         return cached || network;
       })
     )

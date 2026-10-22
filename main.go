@@ -81,7 +81,7 @@ type Hub struct {
 type Client struct {
 	hub      *Hub
 	conn     *websocket.Conn
-	send     chan *Message
+	send     chan any // сообщения и служебные события (presence, звонки)
 	userID   int64
 	username string
 }
@@ -95,6 +95,15 @@ type Config struct {
 	Origins   []string
 	MaxUpload int64
 	StartTime time.Time
+
+	// GOR_TRUSTED_PROXIES: IP или CIDR, от которых доверяем X-Real-IP /
+	// X-Forwarded-For (rate-limit по реальному клиенту). По умолчанию —
+	// только loopback.
+	TrustedIPs  []net.IP
+	TrustedNets []*net.IPNet
+
+	// GOR_GIPHY_KEY: проксируем поиск GIF через сервер, ключ не светится в бандле.
+	GiphyKey string
 }
 
 var (
@@ -132,14 +141,39 @@ func buildConfig() Config {
 		}
 	}
 
+	proxies := os.Getenv("GOR_TRUSTED_PROXIES")
+	if strings.TrimSpace(proxies) == "" {
+		proxies = "127.0.0.1,::1"
+	}
+	var trustedIPs []net.IP
+	var trustedNets []*net.IPNet
+	for _, p := range strings.Split(proxies, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if ip := net.ParseIP(p); ip != nil {
+			trustedIPs = append(trustedIPs, ip)
+			continue
+		}
+		if _, ipnet, err := net.ParseCIDR(p); err == nil {
+			trustedNets = append(trustedNets, ipnet)
+			continue
+		}
+		log.Printf("GOR_TRUSTED_PROXIES: элемент %q не IP и не CIDR — пропущен", p)
+	}
+
 	return Config{
-		Port:      *port,
-		DBPath:    getenv("GOR_DB", "./chat.db"),
-		UploadDir: getenv("GOR_UPLOADS", "./uploads"),
-		StaticDir: staticDir,
-		Origins:   origins,
-		MaxUpload: 50 * 1024 * 1024,
-		StartTime: time.Now(),
+		Port:        *port,
+		DBPath:      getenv("GOR_DB", "./chat.db"),
+		UploadDir:   getenv("GOR_UPLOADS", "./uploads"),
+		StaticDir:   staticDir,
+		Origins:     origins,
+		MaxUpload:   50 * 1024 * 1024,
+		StartTime:   time.Now(),
+		TrustedIPs:  trustedIPs,
+		TrustedNets: trustedNets,
+		GiphyKey:    getenv("GOR_GIPHY_KEY", ""),
 	}
 }
 
@@ -362,41 +396,83 @@ func (d *Database) SaveMessage(msg *Message) error {
 	return nil
 }
 
+// GetMessages — последняя страница истории (для легаси-эндпоинта).
 func (d *Database) GetMessages(chatID int64, limit int) ([]Message, error) {
+	msgs, _, err := d.GetMessagesPage(chatID, limit, 0, 0)
+	return msgs, err
+}
+
+// GetMessagesPage — история с пагинацией:
+//
+//	after  > 0  → сообщения с id > after по возрастанию (догон после реконнекта),
+//	before > 0  → страница СТАРЫХ сообщений, заканчивающаяся id < before,
+//	иначе       → последние limit (в порядке возрастания).
+//
+// hasMore=true — есть ещё сообщения в запрошенном направлении.
+func (d *Database) GetMessagesPage(chatID int64, limit int, after, before int64) ([]Message, bool, error) {
+	if limit <= 0 || limit > 300 {
+		limit = 100
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	query := `SELECT id, COALESCE(chat_id, 1), COALESCE(user_id, 0), username, text, timestamp,
+	const cols = `id, COALESCE(chat_id, 1), COALESCE(user_id, 0), username, text, timestamp,
 		COALESCE(message_type, ''), COALESCE(sticker_id, ''), COALESCE(sticker_url, ''),
 		COALESCE(sticker_pack, ''), COALESCE(file_url, ''), COALESCE(file_name, ''),
-		COALESCE(file_size, 0), COALESCE(file_type, '')
-		FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?`
-	rows, err := d.db.Query(query, chatID, limit)
+		COALESCE(file_size, 0), COALESCE(file_type, '')`
+
+	var query string
+	var args []any
+	var scanOrder func([]Message) []Message
+	switch {
+	case after > 0:
+		query = `SELECT ` + cols + ` FROM messages WHERE chat_id = ? AND id > ? ORDER BY id ASC LIMIT ?`
+		args = []any{chatID, after, limit}
+		scanOrder = func(in []Message) []Message { return in } // уже по возрастанию
+	case before > 0:
+		query = `SELECT ` + cols + ` FROM messages WHERE chat_id = ? AND id < ? ORDER BY id DESC LIMIT ?`
+		args = []any{chatID, before, limit}
+		scanOrder = func(in []Message) []Message { // наоборот: старые сначала
+			for i, j := 0, len(in)-1; i < j; i, j = i+1, j-1 {
+				in[i], in[j] = in[j], in[i]
+			}
+			return in
+		}
+	default:
+		query = `SELECT ` + cols + ` FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?`
+		args = []any{chatID, limit}
+		scanOrder = func(in []Message) []Message {
+			// старые сначала
+			for i, j := 0, len(in)-1; i < j; i, j = i+1, j-1 {
+				in[i], in[j] = in[j], in[i]
+			}
+			return in
+		}
+	}
+
+	rows, err := d.db.Query(query, args...)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer rows.Close()
 
+	var count int
 	var messages []Message
 	for rows.Next() {
+		count++
 		var msg Message
 		if err := rows.Scan(&msg.ID, &msg.ChatID, &msg.UserID, &msg.Username, &msg.Text, &msg.Timestamp,
 			&msg.Type, &msg.StickerID, &msg.StickerURL, &msg.StickerPack,
 			&msg.FileURL, &msg.FileName, &msg.FileSize, &msg.FileType); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		messages = append(messages, msg)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-
-	// старые сначала
-	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
-		messages[i], messages[j] = messages[j], messages[i]
-	}
-
-	return messages, nil
+	return scanOrder(messages), count == limit, nil
 }
 
 // ---------- Chats ----------
@@ -816,6 +892,12 @@ func (h *Hub) stop() {
 	}
 }
 
+// writeISO — единый формат времени для БД и WS: UTC RFC3339.
+// Старые записи (только ЧЧ:ММ:СС) клиент показывает как есть.
+func writeISO(t time.Time) string {
+	return t.UTC().Format(time.RFC3339)
+}
+
 func (h *Hub) run() {
 	for {
 		select {
@@ -827,12 +909,13 @@ func (h *Hub) run() {
 
 			log.Printf("[%s] подключился. Online: %d\n", client.username, clientCount)
 
-			h.broadcast <- &Message{
-				ChatID:    1,
-				Username:  "System",
-				Text:      fmt.Sprintf("[%s] присоединился к чату", client.username),
-				Timestamp: time.Now().Format("15:04:05"),
-			}
+			// Присутствие — это событие, а не сообщение в общем чате.
+			h.sendToAll(map[string]any{
+				"type":     "presence",
+				"event":    "join",
+				"username": client.username,
+				"online":   clientCount,
+			})
 
 		case client := <-h.unregister:
 			h.mu.RLock()
@@ -841,12 +924,12 @@ func (h *Hub) run() {
 			if ok {
 				h.removeClient(client)
 				log.Printf("[%s] отключился\n", client.username)
-				h.broadcast <- &Message{
-					ChatID:    1,
-					Username:  "System",
-					Text:      fmt.Sprintf("[%s] покинул чат", client.username),
-					Timestamp: time.Now().Format("15:04:05"),
-				}
+				h.sendToAll(map[string]any{
+					"type":     "presence",
+					"event":    "leave",
+					"username": client.username,
+					"online":   len(h.clients),
+				})
 			}
 
 		case message := <-h.broadcast:
@@ -855,7 +938,7 @@ func (h *Hub) run() {
 			}
 			if message.Username != "System" {
 				if message.Timestamp == "" {
-					message.Timestamp = time.Now().Format("15:04:05")
+					message.Timestamp = writeISO(time.Now())
 				}
 				if err := h.db.SaveMessage(message); err != nil {
 					log.Printf("Failed to save message: %v\n", err)
@@ -881,6 +964,25 @@ func (h *Hub) run() {
 				client.conn.Close()
 			}
 		}
+	}
+}
+
+// sendToAll рассылает событие всем подключённым клиентам без записи в БД
+// (presence, звонки и т.п.). Медленные клиенты отключаются, как и с сообщениями.
+func (h *Hub) sendToAll(v any) {
+	var dead []*Client
+	h.mu.RLock()
+	for client := range h.clients {
+		select {
+		case client.send <- v:
+		default:
+			dead = append(dead, client)
+		}
+	}
+	h.mu.RUnlock()
+	for _, client := range dead {
+		h.removeClient(client)
+		client.conn.Close()
 	}
 }
 
@@ -921,7 +1023,7 @@ func (c *Client) readPump() {
 		}
 		msg.UserID = c.userID
 		msg.Username = c.username
-		msg.Timestamp = time.Now().Format("15:04:05")
+		msg.Timestamp = writeISO(time.Now())
 		c.hub.broadcast <- &msg
 	}
 }
@@ -988,7 +1090,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 	client := &Client{
 		hub:      hub,
 		conn:     conn,
-		send:     make(chan *Message, 256),
+		send:     make(chan any, 256),
 		userID:   user.ID,
 		username: user.Username,
 	}
@@ -1007,7 +1109,8 @@ var (
 		h, _ := hashPassword("gor-dummy-password-for-timing")
 		return h
 	}()
-	authLimiter = newRateLimiter(20, 5*time.Minute)
+	authLimiter  = newRateLimiter(20, 5*time.Minute)
+	giphyLimiter = newRateLimiter(120, time.Minute)
 )
 
 type credentials struct {
@@ -1054,14 +1157,41 @@ func (l *rateLimiter) Allow(key string) bool {
 	return true
 }
 
+func isTrustedProxy(host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	for _, trusted := range config.TrustedIPs {
+		if trusted.Equal(ip) {
+			return true
+		}
+	}
+	for _, ipnet := range config.TrustedNets {
+		if ipnet.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// clientIP определяет адрес клиента. Заголовки X-Real-IP / X-Forwarded-For
+// учитываются только от доверенных прокси (GOR_TRUSTED_PROXIES, по умолчанию
+// loopback). Прямой пользователь с подделанным заголовком свой IP подменить не сможет.
 func clientIP(r *http.Request) string {
-	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		return strings.TrimSpace(strings.Split(forwarded, ",")[0])
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
 	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
+	if isTrustedProxy(host) {
+		if real := strings.TrimSpace(r.Header.Get("X-Real-IP")); real != "" {
+			return real
+		}
+		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+			return strings.TrimSpace(strings.Split(forwarded, ",")[0])
+		}
 	}
-	return r.RemoteAddr
+	return host
 }
 
 func tokenFromRequest(r *http.Request) string {
@@ -1406,7 +1536,10 @@ func handleChatSubroutes(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case parts[1] == "messages" && r.Method == http.MethodGet:
-		messages, err := db.GetMessages(chatID, 100)
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+		before, _ := strconv.ParseInt(r.URL.Query().Get("before"), 10, 64)
+		messages, hasMore, err := db.GetMessagesPage(chatID, limit, after, before)
 		if err != nil {
 			log.Printf("get chat messages: %v", err)
 			http.Error(w, "Не удалось загрузить сообщения", http.StatusInternalServerError)
@@ -1415,7 +1548,7 @@ func handleChatSubroutes(w http.ResponseWriter, r *http.Request) {
 		if messages == nil {
 			messages = []Message{}
 		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{"messages": messages})
+		writeJSON(w, http.StatusOK, map[string]interface{}{"messages": messages, "hasMore": hasMore})
 
 	case parts[1] == "read" && r.Method == http.MethodPost:
 		var body struct {
@@ -1493,6 +1626,74 @@ func safeUploadName(name string) string {
 	return name
 }
 
+// handleGiphy — прокси поиска GIF. Ключ живёт в GOR_GIPHY_KEY на сервере,
+// а не в бандле клиента; поисковые запросы не уходят на GIPHY напрямую от юзера.
+func handleGiphy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, ok := requireUser(w, r); !ok {
+		return
+	}
+	if !giphyLimiter.Allow(clientIP(r)) {
+		http.Error(w, "Слишком много запросов, попробуйте позже", http.StatusTooManyRequests)
+		return
+	}
+	if config.GiphyKey == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"error": "GIPHY отключён: задайте GOR_GIPHY_KEY на сервере",
+		})
+		return
+	}
+
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if query == "" {
+		http.Error(w, "Укажите поисковый запрос ?q=", http.StatusBadRequest)
+		return
+	}
+	apiURL := fmt.Sprintf("https://api.giphy.com/v1/gifs/search?api_key=%s&q=%s&limit=12&rating=pg-13",
+		url.QueryEscape(config.GiphyKey), url.QueryEscape(query))
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(apiURL)
+	if err != nil {
+		log.Printf("giphy: %v", err)
+		http.Error(w, "Не удалось выполнить поиск GIF", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	var payload struct {
+		Data []struct {
+			ID     string `json:"id"`
+			Title  string `json:"title"`
+			Images struct {
+				FixedWidthDownsampled struct {
+					URL string `json:"url"`
+				} `json:"fixed_width_downsampled"`
+			} `json:"images"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&payload); err != nil {
+		http.Error(w, "От GIPHY пришёл некорректный ответ", http.StatusBadGateway)
+		return
+	}
+
+	gifs := make([]map[string]string, 0, len(payload.Data))
+	for _, item := range payload.Data {
+		if item.ID == "" || item.Images.FixedWidthDownsampled.URL == "" {
+			continue
+		}
+		gifs = append(gifs, map[string]string{
+			"id":    item.ID,
+			"url":   item.Images.FixedWidthDownsampled.URL,
+			"title": item.Title,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"data": gifs})
+}
+
 func handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1561,7 +1762,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		Username:  username,
 		Text:      "📎 Отправил файл",
 		Type:      "file",
-		Timestamp: time.Now().Format("15:04:05"),
+		Timestamp: writeISO(time.Now()),
 		FileURL:   fmt.Sprintf("/uploads/%s", filepath.Base(filename)),
 		FileName:  originalName,
 		FileSize:  size,
@@ -1731,6 +1932,7 @@ func main() {
 	mux.HandleFunc("/api/chats/", handleChatSubroutes)
 	mux.HandleFunc("/api/upload", handleUpload)
 	mux.HandleFunc("/api/download", handleDownload)
+	mux.HandleFunc("/api/giphy", handleGiphy)
 	mux.HandleFunc("/uploads/", handleUploadsRead)
 
 	if _, err := os.Stat(config.StaticDir); err == nil {

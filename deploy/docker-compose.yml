@@ -4,8 +4,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
       args:
-        VERSION: "0.2.0"
-        # REACT_APP_GIPHY_API_KEY: "ваш_ключ"   # опционально
+        VERSION: "0.9.1"
     container_name: gor
     restart: unless-stopped
     ports:
@@ -16,6 +15,7 @@ services:
       GOR_UPLOADS: /data/uploads
       GOR_STATIC: /app/frontend/build
       # GOR_ORIGINS: "https://chat.example.com"  # ограничить Origin для WS
+      # GOR_GIPHY_KEY: "ваш_ключ_giphy"          # поиск GIF через /api/giphy
       TZ: Europe/Moscow
     volumes:
       - ./data:/data

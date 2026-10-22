@@ -74,11 +74,12 @@ ssh -R 80:127.0.0.1:8080 nokey@localhost.run
 | POST | `/api/auth/register` / `/api/auth/login` | получить токен |
 | GET | `/api/chats` | мои чаты |
 | POST | `/api/chats` | создать `{type:"direct"…}` или `{type:"group"…}` |
-| GET | `/api/chats/{id}/messages` | история |
+| GET | `/api/chats/{id}/messages` | история (`?after=` догон, `?before=` старые, `?limit=` ≤300) |
 | POST | `/api/chats/{id}/read` | отметить прочитанным |
 | GET | `/api/users?q=ник` | поиск людей |
 | POST | `/api/upload` | файл (multipart, ≤50 МБ) |
-| WS | `/ws?token=…` | живые сообщения |
+| GET | `/api/giphy?q=` | поиск GIF (серверу нужен `GOR_GIPHY_KEY`) |
+| WS | `/ws` | живые сообщения + `presence`; токен — первым кадром |
 
 Заголовок авторизации: `Authorization: Bearer <token>`.
 
@@ -109,8 +110,9 @@ cd desktop && npx tauri android init --ci && npx tauri android build --ci --apk
 - [x] Android: PWA + APK
 - [x] Жесты в стиле Signal
 - [x] VAKSA: тёмная тема, Roboto, иконка-губка
+- [x] Фоновая надёжность: WS-реконнект + догон сообщений, разделители дней
 - [ ] Push через FCM
-- [ ] Голосовые
+- [ ] Голосовые (сигналинг через WS + WebRTC)
 - [ ] E2E-шифрование
 
 ---
