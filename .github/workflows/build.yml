@@ -217,8 +217,12 @@ jobs:
         working-directory: desktop
         run: |
           npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
-          # gradle пишет debug-keystore в ~/.config/.android — на раннере каталог не создан
-          mkdir -p "$HOME/.config/.android"
+          # gradle пишет debug-keystore в пользовательский ".android":
+          # на раннере путь занят root'ом — уводим в ANDROID_USER_HOME и чиним права.
+          export ANDROID_USER_HOME="$RUNNER_TEMP/android-user-home"
+          export ANDROID_SDK_HOME="$RUNNER_TEMP/android-user-home"
+          mkdir -p "$ANDROID_USER_HOME"
+          sudo chown -R "$(id -un):$(id -gn)" "$HOME/.config" 2>/dev/null || true
           npx tauri android init --ci
           bash patch-android-permissions.sh
           # Если секреты подписи заданы — релизная подпись; иначе debug-APK (ставится на любую телефон)
