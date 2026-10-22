@@ -217,6 +217,8 @@ jobs:
         working-directory: desktop
         run: |
           npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          # gradle пишет debug-keystore в ~/.config/.android — на раннере каталог не создан
+          mkdir -p "$HOME/.config/.android"
           npx tauri android init --ci
           bash patch-android-permissions.sh
           # Если секреты подписи заданы — релизная подпись; иначе debug-APK (ставится на любую телефон)
