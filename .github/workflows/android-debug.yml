@@ -43,26 +43,41 @@ jobs:
           npm ci --no-audit --no-fund || npm install --no-audit --no-fund
           npm run build
 
-      - name: Init android + diag gradle
+      - name: Tauri android build (как в build.yml)
         working-directory: desktop
         run: |
           npm ci --no-audit --no-fund || npm install --no-audit --no-fund
           export ANDROID_USER_HOME="$RUNNER_TEMP/android-user-home"
+          export ANDROID_SDK_HOME="$RUNNER_TEMP/android-user-home"
+          sudo mkdir -p "$HOME/.config/.android" "$ANDROID_HOME/.android"
+          sudo chmod -R a+rwX "$HOME/.config/.android" "$ANDROID_HOME/.android" 2>/dev/null || true
           npx tauri android init --ci
           bash patch-android-permissions.sh
           printf '\norg.gradle.configuration-cache=false\n' >> src-tauri/gen/android/gradle.properties
-          # Диагностика: пусть gradle сам расскажет, где боль
-          cd src-tauri/gen/android
-          (./gradlew :app:assembleUniversalDebug --stacktrace --info 2>&1 | tee "${{ github.workspace }}/gradle-diag.log") || true
-          # Печать ключевых делений прямо в лог
-          grep -nE "Caused by|Exception" "$PWD/../../gradle-diag.log" | head -60 || true
-          mkdir -p /home/runner/.config/.android 2>/dev/null; ls -ld /home/runner/.config/.android || true
-          ls -ld "$HOME/.config" "$HOME/.config/.android" || true
-          id; echo HOME=$HOME
+          npx tauri android build --ci --apk --debug || true
+
+      - name: Collect gradle stacktrace (или APK если собралось)
+        if: always()
+        working-directory: desktop/src-tauri/gen/android
+        run: |
+          ls -ld "$HOME/.android" "$HOME/.config/.android" "$ANDROID_HOME/.android" 2>&1 | tee -a "$GITHUB_WORKSPACE/diag-env.log" || true
+          ls -l tauri.settings.gradle settings.gradle 2>&1 | tee -a "$GITHUB_WORKSPACE/diag-env.log" || true
+          (./gradlew :app:assembleUniversalDebug --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/gradle-diag.log") || true
+          grep -nE "Caused by" "$GITHUB_WORKSPACE/gradle-diag.log" | head -40
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: gradle-diag
-          path: gradle-diag.log
+          path: |
+            gradle-diag.log
+            diag-env.log
           if-no-files-found: warn
+
+      - name: Поднять APK если собрался
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diag-apk
+          path: desktop/src-tauri/gen/android/app/build/outputs/apk/universal/*.apk
+          if-no-files-found: ignore
