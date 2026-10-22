@@ -130,10 +130,6 @@ function App() {
   const longPressRef = useRef(false);
   const toastTimerRef = useRef(null);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
-
   const username = user ? user.username : '';
   const activeChat = chats.find((chat) => chat.id === activeChatId) || null;
 
@@ -1676,6 +1672,11 @@ function App() {
             </div>
           )}
           {loadingOlder && <div className="history-loading">загрузка истории…</div>}
+          {!loadingOlder && canLoadOlder && (
+            <button type="button" className="history-more" onClick={loadOlder}>
+              ⤒ показать более старые сообщения
+            </button>
+          )}
           {renderedMessages.map((row) => (
             row.divider ? (
               <div key={row.key} className="day-divider"><span>{row.label}</span></div>
