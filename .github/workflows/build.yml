@@ -217,9 +217,11 @@ jobs:
         working-directory: desktop
         run: |
           npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
-          # gradle/AGP пишет служебные директории в пользовательский ".android":
-          # на раннере эти пути созданы root'ом и не пишутся → AGP-плагин падает.
-          export ANDROID_USER_HOME="$RUNNER_TEMP/android-user-home"
+          # gradle/AGP пишет служебные директории в пользовательский ".android".
+          # ВАЖНО: ANDROID_USER_HOME — это сам каталог ".android", а ANDROID_SDK_HOME —
+          # его РОДИТЕЛЬ. Совпадение значений роняет AGP: "Could not create provider
+          # for value source AndroidLocationsBuildService.AndroidDirectoryCreator".
+          export ANDROID_USER_HOME="$RUNNER_TEMP/android-user-home/.android"
           export ANDROID_SDK_HOME="$RUNNER_TEMP/android-user-home"
           sudo mkdir -p "$HOME/.config/.android" "$ANDROID_HOME/.android"
           sudo chmod -R a+rwX "$HOME/.config/.android" "$ANDROID_HOME/.android" "$HOME/.config" 2>/dev/null || true
