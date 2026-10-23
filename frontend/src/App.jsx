@@ -333,21 +333,25 @@ function App() {
 
       try {
         const response = await authFetch('/api/auth/me');
-        if (!response.ok) {
-          throw new Error('unauthorized');
-        }
-        const data = await response.json();
-        if (!cancelled) {
-          setUser(data.user);
-          if (data.user?.avatar) {
-            setAvatars((prev) => ({ ...prev, [data.user.username]: data.user.avatar }));
+        if (response.status === 401) {
+          // Сервер честно сказал «токен не тот» — выходим.
+          clearToken();
+          if (!cancelled) setUser(null);
+        } else if (response.ok) {
+          const data = await response.json();
+          if (!cancelled) {
+            setUser(data.user);
+            if (data.user?.avatar) {
+              setAvatars((prev) => ({ ...prev, [data.user.username]: data.user.avatar }));
+            }
           }
+        } else {
+          // 5xx от сервера — токен, возможно, жив; не выкидываем.
+          console.warn('auth/me:', response.status);
         }
       } catch (error) {
-        clearToken();
-        if (!cancelled) {
-          setUser(null);
-        }
+        // Сетевые глюки/таймауты (AbortError, оффлайн) НЕ выбрасывают из аккаунта.
+        console.warn('auth/me network:', error?.message || error);
       } finally {
         if (!cancelled) {
           setAuthChecking(false);
