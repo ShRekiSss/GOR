@@ -230,6 +230,23 @@ jobs:
           bash patch-android-permissions.sh
           # ValueSource AndroidDirectoryCreator падает под configuration cache — отключаем.
           printf '\norg.gradle.configuration-cache=false\n' >> src-tauri/gen/android/gradle.properties
+          # ГЛАВНЫЙ ФИКС: `tauri android build` запускает gradle с отфильтрованным
+          # окружением (белый список: PATH, HOME, CARGO_*, ANDROID_HOME, NDK_HOME...),
+          # из-за чего ANDROID_USER_HOME не доходит до gradle и AGP падает на
+          # AndroidLocationsBuildService (~/.config/.android на раннере root-owned).
+          # Оборачиваем gradlew: восстанавливаем вырезанные переменные перед exec.
+          mv src-tauri/gen/android/gradlew src-tauri/gen/android/gradlew.bin
+          cat > src-tauri/gen/android/gradlew <<'WRAP'
+          #!/bin/sh
+          # ci: tauri CLI отфильтровал окружение — восстанавливаем для AGP
+          export ANDROID_USER_HOME="${ANDROID_USER_HOME:-/tmp/android-user-home}"
+          export ANDROID_SDK_HOME="${ANDROID_SDK_HOME:-/tmp/android-user-home}"
+          mkdir -p "$ANDROID_USER_HOME" 2>/dev/null || true
+          exec "$(dirname "$0")/gradlew.bin" "$@"
+          WRAP
+          chmod +x src-tauri/gen/android/gradlew
+          head -7 src-tauri/gen/android/gradlew
+          grep -q "ANDROID_USER_HOME" src-tauri/gen/android/gradlew || (echo "::error::gradlew не создан"; exit 1)
           # Если секреты подписи заданы — релизная подпись; иначе debug-APK (ставится на любую телефон)
           if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
             echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > src-tauri/release.jks
