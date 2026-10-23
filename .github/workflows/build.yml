@@ -277,11 +277,12 @@ jobs:
               ;;
           esac
           KS=/tmp/vaksa-ci.jks
-          keytool -genkeypair -v -keystore "$KS" -storepass vaksa-ci-store -keypass vaksa-ci-key \
+          # ВАЖНО: и store-pass, и key-pass одинаковые — PKCS12 привязывает ключ к паролю хранилища.
+          keytool -genkeypair -v -keystore "$KS" -storepass vaksa-ci -keypass vaksa-ci \
             -alias vaksa -keyalg RSA -keysize 2048 -validity 10950 \
             -dname "CN=VAKSA, OU=GOR, O=VAKSA, C=RU" >/dev/null 2>&1
           "$BT/zipalign" -f 4 "$APK" "$APK.aligned"
-          "$BT/apksigner" sign --ks "$KS" --ks-pass pass:vaksa-ci-store --key-pass pass:vaksa-ci-key \
+          "$BT/apksigner" sign --ks "$KS" --ks-pass pass:vaksa-ci --key-pass pass:vaksa-ci \
             --out "$APK" "$APK.aligned" 2>&1
           "$BT/apksigner" verify "$APK"
           mv "$APK" "VAKSA-universal.apk"
