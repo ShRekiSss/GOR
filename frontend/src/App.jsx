@@ -1111,10 +1111,9 @@ function App() {
       const response = await fetch(apiUrl(endpoint), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          username,
-          password: authForm.password,
-        }),
+        body: JSON.stringify({ username, password: authForm.password }),
+        // 15 секунд максимум — кнопка не должна висеть бесконечно.
+        signal: AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined,
       });
 
       const text = await response.text();

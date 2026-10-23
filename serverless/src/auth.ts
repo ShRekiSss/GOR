@@ -109,12 +109,29 @@ export async function userByToken(env: Env, token: string): Promise<User | null>
 
 // ---------- Лимитер (/api/auth/*): 20 попыток / 5 минут на IP ----------
 
+// Лимитер НЕ имеет права вешать вход навсегда: если DO завис/отвечает медленно —
+// пропускаем (fail-open). Лучше короткая окно без лимита, чем вечная «крутилка».
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  return Promise.race([
+    p.catch(() => null),
+    new Promise<null>((r) => setTimeout(() => r(null), ms)),
+  ]);
+}
+
 export async function rateLimitAuth(env: Env, ip: string): Promise<boolean> {
   const id = env.LIMIT.idFromName(ip);
   const stub = env.LIMIT.get(id);
-  const resp = await stub.fetch('https://limit/allow', {
-    method: 'POST',
-    body: JSON.stringify({ limit: 20, window: 300 }),
-  });
+  const resp = await withTimeout(
+    stub.fetch('https://limit/allow', {
+      method: 'POST',
+      body: JSON.stringify({ limit: 20, window: 300 }),
+    }),
+    5000,
+  );
+  // null = DO завис/упал → пропускаем, вход не блокируем.
+  if (!resp) {
+    console.warn('rate limiter недоступен — fail-open для', ip);
+    return true;
+  }
   return resp.status === 200;
 }

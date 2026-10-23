@@ -44,5 +44,11 @@ export function authHeaders(extra) {
 export function authFetch(path, options) {
   const opts = { ...(options || {}) };
   opts.headers = authHeaders(opts.headers);
+  // Никогда не крутим «вечно»: 20 секунд — и честная ошибка на экране.
+  try {
+    opts.signal = AbortSignal.timeout(20000);
+  } catch (e) {
+    // старый WebView без AbortSignal.timeout — живём по-старому, без таймаута
+  }
   return fetch(apiUrl(path), opts);
 }
