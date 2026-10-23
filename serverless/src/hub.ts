@@ -110,6 +110,35 @@ export class Hub {
       return;
     }
 
+    // Реакция emoji: голос ставится/снимается, всем рассылается событие.
+    if (data?.type === 'react' && data?.messageId && data?.emoji) {
+      const mid = Number(data.messageId);
+      const emoji = String(data.emoji).slice(0, 16);
+      const chat = await this.env.DB.prepare(
+        'SELECT COALESCE(chat_id, 1) AS chat_id FROM messages WHERE id = ?',
+      ).bind(mid).first<{ chat_id: number }>();
+      if (!chat) return;
+      if (data.remove) {
+        await this.env.DB.prepare(
+          'DELETE FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?',
+        ).bind(mid, s.userID, emoji).run();
+      } else {
+        await this.env.DB.prepare(
+          'INSERT OR REPLACE INTO reactions (message_id, user_id, username, emoji) VALUES (?, ?, ?, ?)',
+        ).bind(mid, s.userID, s.username, emoji).run();
+      }
+      this.broadcast({
+        type: 'reaction',
+        messageId: mid,
+        chatId: Number(chat.chat_id) || 1,
+        userId: s.userID,
+        username: s.username,
+        emoji,
+        remove: !!data.remove,
+      } as any);
+      return;
+    }
+
     // «X печатает…» — только событие, в БД не пишем.
     if (data?.type === 'typing' && data?.chatId) {
       this.broadcast({
@@ -180,18 +209,19 @@ export async function saveAndBroadcast(env: Env, f: Frame): Promise<Frame> {
     .bind(ins.meta.last_row_id as number).first<any>();
   const saved = row ? frameFromRow(row) : { ...f, chatId: chatID, timestamp: ts } as Frame;
 
-  broadcastOnly(env, saved);
   return saved;
 }
 
-// Разослать (без записи) — вызывается из api.ts после upload.
-export function broadcastOnly(env: Env, f: Frame) {
+// Разослать из REST-кода (api.ts): DO-апдейт по имени хаба.
+// ВАЖНО: обязательно await'ить — иначе Workers прибивает фоновый fetch
+// до завершения ответа, и рассылка теряется.
+export function broadcastOnly(env: Env, f: unknown): Promise<Response> {
   const stub = env.HUB.get(env.HUB.idFromName('hub'));
-  stub.fetch('https://hub/broadcast', {
+  return stub.fetch('https://hub/broadcast', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(f),
-  }).catch(() => { /* WS-рассылка лучше усилий */ });
+  }).catch(() => null as unknown as Response);
 }
 
 export function hhmmss(): string {

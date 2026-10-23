@@ -1943,3 +1943,127 @@ input {
 .msg-menu button.danger:hover {
   background: rgba(224, 87, 74, 0.14);
 }
+
+/* ---------- Реакции, ✓✓, аватарки, markdown ---------- */
+
+.react-row {
+  display: flex;
+  gap: 4px;
+  padding: 4px 0 8px;
+}
+
+.react-btn {
+  flex: 1;
+  padding: 8px 0;
+  border: none;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  font-size: 1.15rem;
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.12s ease;
+}
+
+.react-btn:hover {
+  background: rgba(46, 166, 255, 0.18);
+  transform: scale(1.08);
+}
+
+.msg-reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
+
+.msg-react-chip {
+  padding: 3px 9px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+  color: #d7e3f4;
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.msg-react-chip:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.msg-react-chip.mine {
+  border-color: #2ea6ff;
+  background: rgba(46, 166, 255, 0.16);
+}
+
+.msg-avatar-img {
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+.chat-item-avatar {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  object-fit: cover;
+  margin-right: 8px;
+  flex-shrink: 0;
+}
+
+.avatar-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 6px 2px 10px;
+}
+
+.avatar-preview {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
+.avatar-preview.avatar-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #2ea6ff;
+  color: #0b1c28;
+  font-size: 1.5rem;
+  font-weight: 800;
+}
+
+.avatar-name {
+  font-weight: 700;
+  color: #f5f8ff;
+  margin-bottom: 3px;
+}
+
+.avatar-change {
+  padding: 4px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 10px;
+  background: transparent;
+  color: #9ec9ef;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+
+.avatar-change:hover {
+  background: rgba(46, 166, 255, 0.12);
+  border-color: rgba(46, 166, 255, 0.4);
+}
+
+.message-text code {
+  padding: 1px 5px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.10);
+  font-family: 'Roboto Mono', ui-monospace, monospace;
+  font-size: 0.86em;
+}
+
+.message-text a {
+  color: #6cc0ff;
+  text-decoration: underline;
+}

@@ -132,13 +132,29 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
     return json({ user });
   }
 
+  // Смена аватара профиля: { dataUrl: 'data:image/png;base64,...' } (можно и через
+  // multipart file — клиент шлёт dataUrl с canvas 128px).
+  if (path === '/api/me/avatar' && req.method === 'POST') {
+    let body: { dataUrl?: string };
+    try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
+    const du = String(body.dataUrl || '');
+    if (!/^data:image\/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=]+$/.test(du)) {
+      return text('Формат изображения не поддержан', 400);
+    }
+    if (du.length > 400_000) {
+      return text('Слишком большая картинка (лимит ~300 КиБ)', 400);
+    }
+    await env.DB.prepare('UPDATE users SET avatar = ? WHERE id = ?').bind(du, user.id).run();
+    return json({ user: { ...user, avatar: du } });
+  }
+
   if (path === '/api/users' && req.method === 'GET') {
     const q = (url.searchParams.get('q') || '').trim();
     const pattern = `%${q}%`;
     const rows = await env.DB.prepare(
-      'SELECT id, username FROM users WHERE id != ? AND username LIKE ? ORDER BY username LIMIT 20',
-    ).bind(user.id, pattern).all<User>();
-    return json({ users: rows.results || [] });
+      'SELECT id, username, avatar FROM users WHERE id != ? AND username LIKE ? ORDER BY username LIMIT 20',
+    ).bind(user.id, pattern).all<User & { avatar?: string }>();
+    return json({ users: (rows.results || []).map((u) => ({ ...u, avatar: u.avatar || '' })) });
   }
 
   // ---------- chats ----------
@@ -155,8 +171,10 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
     if (!(await isMember(env, chatID, user.id))) return text('Нет доступа к чату', 403);
 
     if (sub === 'messages' && req.method === 'GET') {
-      const messages = await getMessages(env, chatID, 100);
-      return json({ messages });
+      const after = Number(url.searchParams.get('after')) || 0;
+      const before = Number(url.searchParams.get('before')) || 0;
+      const limit = Math.min(Number(url.searchParams.get('limit')) || 100, 200);
+      return json(await getMessages(env, chatID, limit, after, before, user.id));
     }
     if (sub === 'read' && req.method === 'POST') {
       let body: { messageId?: number };
@@ -164,6 +182,11 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
       await env.DB.prepare(
         'UPDATE chat_members SET last_read_message_id = MAX(last_read_message_id, ?) WHERE chat_id = ? AND user_id = ?',
       ).bind(body.messageId || 0, chatID, user.id).run();
+      // ✓✓ вживую: авторы сообщений чата узнают, что их прочитали до этого id.
+      await broadcastOnly(env, {
+        type: 'read', chatId: chatID, userId: user.id, username: user.username,
+        messageId: Number(body.messageId) || 0,
+      } as any);
       return new Response(null, { status: 204 });
     }
     return text('Не найдено', 404);
@@ -173,7 +196,7 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
   if (path === '/api/messages' && req.method === 'GET') {
     const chatID = Number(url.searchParams.get('chatId')) || 1;
     if (!(await isMember(env, chatID, user.id))) return text('Нет доступа к чату', 403);
-    return json(await getMessages(env, chatID, 100));
+    return json(await getMessages(env, chatID, 100, 0, 0, user.id));
   }
 
   // ---------- upload ----------
@@ -236,13 +259,66 @@ export function frameFromRow(r: any): Frame {
   };
 }
 
-export async function getMessages(env: Env, chatID: number, limit: number): Promise<Frame[]> {
-  const rows = await env.DB.prepare(
-    `SELECT * FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?`,
-  ).bind(chatID, limit).all();
-  const out = (rows.results || []).map(frameFromRow);
-  out.reverse(); // старые сначала
-  return out;
+export async function getMessages(
+  env: Env,
+  chatID: number,
+  limit: number,
+  after = 0,
+  before = 0,
+  viewer = 0,
+): Promise<{ messages: Frame[]; reactions: Record<string, { emoji: string; count: number; usernames: string[] }[]>; hasMore: boolean; foreignRead: number }> {
+
+  let out: Frame[];
+  if (after > 0) {
+    // Догон: всё, что новее after, старые сначала.
+    const rows = await env.DB.prepare(
+      'SELECT * FROM messages WHERE chat_id = ? AND id > ? ORDER BY id ASC LIMIT ?',
+    ).bind(chatID, after, limit).all();
+    out = (rows.results || []).map(frameFromRow);
+  } else if (before > 0) {
+    // Пагинация назад: страница перед самым старым загруженным.
+    const rows = await env.DB.prepare(
+      'SELECT * FROM messages WHERE chat_id = ? AND id < ? ORDER BY id DESC LIMIT ?',
+    ).bind(chatID, before, limit).all();
+    out = (rows.results || []).map(frameFromRow);
+    out.reverse();
+  } else {
+    const rows = await env.DB.prepare(
+      'SELECT * FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?',
+    ).bind(chatID, limit).all();
+    out = (rows.results || []).map(frameFromRow);
+    out.reverse(); // старые сначала
+  }
+  const hasMore = out.length >= limit;
+
+  // До какого id прочли чат другие участники (для ✓✓ на своих сообщениях).
+  const fr = await env.DB.prepare(
+    `SELECT COALESCE(MAX(last_read_message_id), 0) AS n FROM chat_members
+     WHERE chat_id = ? AND user_id != ?`,
+  ).bind(chatID, viewer).first<{ n: number }>().catch(() => null);
+  const foreignReadId = fr?.n || 0;
+
+  // Реакции по этим сообщениям — одним запросом.
+  const ids = out.map((m) => m.id).filter(Boolean);
+  const reactions: Record<string, { emoji: string; count: number; usernames: string[] }[]> = {};
+  if (ids.length) {
+    const ph = ids.map(() => '?').join(',');
+    const rrows = await env.DB.prepare(
+      `SELECT message_id, emoji, username FROM reactions WHERE message_id IN (${ph})`,
+    ).bind(...ids).all<{ message_id: number; emoji: string; username: string }>();
+    for (const r of rrows.results || []) {
+      const key = String(r.message_id);
+      reactions[key] = reactions[key] || [];
+      let agg = reactions[key].find((x) => x.emoji === r.emoji);
+      if (!agg) {
+        agg = { emoji: r.emoji, count: 0, usernames: [] };
+        reactions[key].push(agg);
+      }
+      agg.count += 1;
+      agg.usernames.push(r.username);
+    }
+  }
+  return { messages: out, reactions, hasMore, foreignRead: foreignReadId };
 }
 
 export async function listChats(env: Env, userID: number) {
@@ -272,13 +348,14 @@ export async function listChats(env: Env, userID: number) {
 
     if (r.type === 'direct') {
       const peer = await env.DB.prepare(
-        `SELECT u.id, u.username FROM chat_members cm JOIN users u ON u.id = cm.user_id
+        `SELECT u.id, u.username, u.avatar FROM chat_members cm JOIN users u ON u.id = cm.user_id
          WHERE cm.chat_id = ? AND cm.user_id != ? LIMIT 1`,
       ).bind(r.id, userID).first<any>();
       if (peer) {
         chat.peerId = peer.id;
         chat.peer = peer.username;
         chat.title = peer.username;
+        chat.avatar = peer.avatar || '';
       }
     }
     items.push({ chat, lastID });
@@ -415,7 +492,8 @@ async function handleUpload(req: Request, env: Env, user: User): Promise<Respons
     fileSize: file.size,
     fileType: fileTypeOf(originalName),
   };
-  await saveAndBroadcast(env, msg);
+  const savedMsg = await saveAndBroadcast(env, msg);
+  await broadcastOnly(env, savedMsg);
 
   return json({
     success: true,

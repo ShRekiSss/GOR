@@ -58,6 +58,12 @@ function App() {
   const [editingMsg, setEditingMsg] = useState(null);
   const [msgMenu, setMsgMenu] = useState(null);
   const [typingUser, setTypingUser] = useState('');
+  // Реакции: { [msgId]: [{emoji, count, usernames}] }.
+  const [reactions, setReactions] = useState({});
+  // До какого id чужие участники дочитали чат: { [chatId]: maxId } — для ✓✓.
+  const [readMarks, setReadMarks] = useState({});
+  // Аватарки профиля по username (из чат-листа, /api/users, /api/auth/me).
+  const [avatars, setAvatars] = useState({});
   const typingSentRef = useRef(0);   // троттлинг outgoing typing
   const typingClearRef = useRef(null); // таймер скрытия индикатора
   const [authChecking, setAuthChecking] = useState(true);
@@ -88,6 +94,7 @@ function App() {
   const wsRef = useRef(null);
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
+  const avatarInputRef = useRef(null);
   const messagesContainerRef = useRef(null);
   const messagesSetRef = useRef(new Set()); // Track message IDs to avoid duplicates
   const activeChatRef = useRef(null);
@@ -142,6 +149,56 @@ function App() {
   const username = user ? user.username : '';
   const activeChat = chats.find((chat) => chat.id === activeChatId) || null;
 
+  // Реакции: влить данные истории (агрегаты) в состояние.
+  const mergeReactions = (map) => {
+    if (!map) return;
+    setReactions((prev) => ({ ...prev, ...map }));
+  };
+
+  // Применить событие реакции (из WS или оптимистично для себя).
+  const applyReaction = (ev) => {
+    const key = String(ev.messageId);
+    setReactions((prev) => {
+      const next = { ...prev };
+      const list = [...(next[key] || [])];
+      const agg = list.find((x) => x.emoji === ev.emoji);
+      if (ev.remove) {
+        if (!agg) return next;
+        const usernames = agg.usernames.filter((n) => n !== ev.username);
+        const count = usernames.length;
+        if (count <= 0) {
+          next[key] = list.filter((x) => x.emoji !== ev.emoji);
+        } else {
+          next[key] = list.map((x) => (x.emoji === ev.emoji ? { ...agg, count, usernames } : x));
+        }
+      } else {
+        if (!agg) {
+          next[key] = [...list, { emoji: ev.emoji, count: 1, usernames: [ev.username] }];
+        } else if (!agg.usernames.includes(ev.username)) {
+          next[key] = list.map((x) => (x.emoji === ev.emoji
+            ? { ...agg, count: agg.count + 1, usernames: [...agg.usernames, ev.username] }
+            : x));
+        }
+      }
+      return next;
+    });
+  };
+
+  // Запомнить аватарку юзера (data URL) для пузырей и списков.
+  const rememberAvatar = (name, avatar) => {
+    if (!name || !avatar) {
+      return;
+    }
+    setAvatars((prev) => (prev[name] === avatar ? prev : { ...prev, [name]: avatar }));
+  };
+
+  const sendReaction = (msg, emoji) => {
+    const agg = (reactions[String(msg.id)] || []).find((x) => x.emoji === emoji);
+    const mine = agg?.usernames.includes(username);
+    wsRef.current?.send(JSON.stringify({ type: 'react', messageId: msg.id, emoji, remove: !!mine }));
+    applyReaction({ messageId: msg.id, emoji, remove: !!mine, username, userId: user?.id });
+  };
+
   // Догон пропущенных сообщений активного чата после реконнекта WS.
   const catchUpRef = useRef(null);
   catchUpRef.current = async (chatId) => {
@@ -150,6 +207,7 @@ function App() {
       const response = await authFetch(`/api/chats/${chatId}/messages?after=${lastIdRef.current}`);
       if (!response.ok) return;
       const data = await response.json();
+      if (data.reactions) mergeReactions(data.reactions);
       const fresh = data.messages || [];
       if (!fresh.length) return;
       const freshKeys = fresh.filter((m) => m.id && !messagesSetRef.current.has(`${m.chatId}-${m.id}`));
@@ -180,6 +238,13 @@ function App() {
       const data = await response.json();
       const list = data.chats || [];
       setChats(list);
+      const known = {};
+      for (const c of list) {
+        if (c.type === 'direct' && c.avatar && c.peer) {
+          known[c.peer] = c.avatar;
+        }
+      }
+      if (Object.keys(known).length) setAvatars((prev) => ({ ...prev, ...known }));
       setActiveChatId((current) => {
         const wanted = selectId || current;
         if (wanted && list.some((chat) => chat.id === wanted)) {
@@ -268,6 +333,9 @@ function App() {
         const data = await response.json();
         if (!cancelled) {
           setUser(data.user);
+          if (data.user?.avatar) {
+            setAvatars((prev) => ({ ...prev, [data.user.username]: data.user.avatar }));
+          }
         }
       } catch (error) {
         clearToken();
@@ -382,6 +450,20 @@ function App() {
           return;
         }
 
+        if (incoming.type === 'reaction') {
+          applyReaction(incoming);
+          return;
+        }
+        if (incoming.type === 'read') {
+          // Чужой дочитал до messageId → мои сообщения в чате выше этого id = ✓✓.
+          if (incoming.userId !== user.id) {
+            setReadMarks((prev) => ({
+              ...prev,
+              [incoming.chatId]: Math.max(prev[incoming.chatId] || 0, incoming.messageId || 0),
+            }));
+          }
+          return;
+        }
         if (incoming.type === 'typing') {
           // «X печатает…» — только для открытого чата и не от себя.
           if (incoming.chatId === activeChatRef.current && incoming.userId !== user.id) {
@@ -540,6 +622,13 @@ function App() {
         if (cancelled) {
           return;
         }
+        if (data.reactions) mergeReactions(data.reactions);
+        if (typeof data.foreignRead === 'number') {
+          setReadMarks((prev) => ({
+            ...prev,
+            [activeChatId]: Math.max(prev[activeChatId] || 0, data.foreignRead),
+          }));
+        }
         const list = data.messages || [];
         setMessages(list);
         messagesSetRef.current = new Set(list.filter((m) => m.id).map((m) => `${m.chatId}-${m.id}`));
@@ -573,6 +662,7 @@ function App() {
       const response = await authFetch(`/api/chats/${chatId}/messages?before=${oldestIdRef.current}&limit=100`);
       if (!response.ok) return;
       const data = await response.json();
+      if (data.reactions) mergeReactions(data.reactions);
       const older = data.messages || [];
       if (!older.length) {
         setCanLoadOlderBoth(false);
@@ -1178,6 +1268,49 @@ function App() {
     }
   };
 
+  // Смена аватара: файл → canvas 128×128 → data URL → POST /api/me/avatar.
+  const handleAvatarFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!/^image\//.test(file.type)) {
+      showToast('Это не картинка');
+      return;
+    }
+    try {
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error('read error'));
+        reader.readAsDataURL(file);
+      });
+      const img = new Image();
+      await new Promise((resolve, reject) => { img.onload = resolve; img.onerror = reject; img.src = dataUrl; });
+      const side = Math.min(img.width, img.height);
+      const canvas = document.createElement('canvas');
+      canvas.width = 128; canvas.height = 128;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, 128, 128);
+      const cropped = canvas.toDataURL('image/jpeg', 0.85);
+      const response = await authFetch('/api/me/avatar', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dataUrl: cropped }),
+      });
+      if (!response.ok) {
+        throw new Error((await response.text()).trim() || 'не удалось загрузить');
+      }
+      const data = await response.json();
+      if (data.user) {
+        setUser(data.user);
+        rememberAvatar(data.user.username, data.user.avatar);
+      }
+      showToast('Аватар обновлён');
+    } catch (error) {
+      showToast(`Не удалось сменить аватар: ${error.message}`);
+    }
+  };
+
   const toggleAutostart = async () => {
     try {
       const plugin = await import('@tauri-apps/plugin-autostart');
@@ -1756,6 +1889,9 @@ function App() {
               onClick={onChatItemClick(chat)}
             >
               <div className="chat-item-top">
+                {chat.type === 'direct' && chat.avatar && (
+                  <img className="chat-item-avatar" src={chat.avatar} alt={chat.peer} />
+                )}
                 <span className="chat-item-title">
                   {chat.type === 'group' ? '# ' : '@ '}{chat.title || chat.peer || 'Чат'}
                 </span>
@@ -1864,9 +2000,11 @@ function App() {
                     title="Долгое нажатие — действия"
                   >
                     <div className="msg-head">
-                      <span className="msg-avatar">{(msg.username?.[0] || '?').toUpperCase()}</span>
+                      {avatars[msg.username]
+                        ? <img className="msg-avatar msg-avatar-img" src={avatars[msg.username]} alt={msg.username} />
+                        : <span className="msg-avatar">{(msg.username?.[0] || '?').toUpperCase()}</span>}
                       <span className="username-label">[{msg.username}]</span>
-                      <span className="timestamp">{localTime(msg.timestamp)}{msg.edited ? ' (изменено)' : ''}</span>
+                      <span className="timestamp">{localTime(msg.timestamp)}{msg.edited ? ' (изменено)' : ''}{msg.userId === user?.id ? (readMarks[msg.chatId] >= msg.id ? ' ✓✓' : ' ✓') : ''}</span>
                     </div>
                     {msg.replyTo ? (
                       (() => {
@@ -1888,8 +2026,27 @@ function App() {
                         );
                       })()
                     ) : null}
-                    {msg.text && <span className="message-text">&gt; {msg.type === 'deleted' ? `🚫 ${msg.text}` : msg.text}</span>}
+                    {msg.text && (
+                      <span className="message-text">&gt; {msg.type === 'deleted' && '🚫 '}
+                        {msg.type === 'deleted' ? msg.text : <Markdown text={msg.text} />}
+                      </span>
+                    )}
                     {renderMessageContent(msg)}
+                    {(reactions[String(msg.id)] || []).length > 0 && (
+                      <div className="msg-reactions">
+                        {reactions[String(msg.id)].map((agg) => (
+                          <button
+                            key={agg.emoji}
+                            type="button"
+                            className={`msg-react-chip ${agg.usernames.includes(username) ? 'mine' : ''}`}
+                            title={agg.usernames.join(', ')}
+                            onClick={() => sendReaction(msg, agg.emoji)}
+                          >
+                            {agg.emoji}{agg.count > 1 ? ` ${agg.count}` : ''}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 );
               })()
@@ -1994,6 +2151,15 @@ function App() {
               <div className="msg-menu-preview">
                 <b>{msgMenu.username}</b>: {(msgMenu.text || '🎨 Стикер / 📎 Файл').slice(0, 90)}
               </div>
+              {msgMenu.type !== 'deleted' && msgMenu.username !== 'System' && (
+                <div className="react-row">
+                  {['👍', '❤️', '😂', '🔥', '😮', '😡'].map((e) => (
+                    <button key={e} type="button" className="react-btn" onClick={() => sendReaction(msgMenu, e)}>
+                      {e}
+                    </button>
+                  ))}
+                </div>
+              )}
               {msgMenu.type !== 'deleted' && msgMenu.username !== 'System' && (
                 <button type="button" onClick={() => { setReplyTo(msgMenu); setEditingMsg(null); setMsgMenu(null); }}>
                   ↩ Ответить
@@ -2165,6 +2331,25 @@ function App() {
           >
             <h2>Настройки</h2>
 
+            <div className="avatar-row">
+              {user?.avatar
+                ? <img className="avatar-preview" src={user.avatar} alt={username} />
+                : <span className="avatar-preview avatar-empty">{(username?.[0] || '?').toUpperCase()}</span>}
+              <div>
+                <div className="avatar-name">{username}</div>
+                <button type="button" className="avatar-change" onClick={() => avatarInputRef.current?.click()}>
+                  Сменить аватар…
+                </button>
+              </div>
+              <input
+                ref={avatarInputRef}
+                type="file"
+                accept="image/*"
+                onChange={handleAvatarFile}
+                style={{ display: 'none' }}
+              />
+            </div>
+
             <label className="settings-label" htmlFor="server-input">Адрес сервера</label>
             <input
               id="server-input"
@@ -2253,3 +2438,30 @@ function App() {
 }
 
 export default App;
+
+// Мини-markdown: **жирный**, *курсив*, `код`, https-ссылки. Чистый JSX — без
+// innerHTML, XSS невозможен по построению.
+function Markdown({ text }) {
+  const src = String(text ?? '');
+  const parts = [];
+  const re = /(\*\*[^*\n]+\*\*|\*[^*\n]+\*|`[^`\n]+`|https?:\/\/[^\s]+)/g;
+  let last = 0;
+  let i = 0;
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    if (m.index > last) parts.push(src.slice(last, m.index));
+    const tok = m[0];
+    if (tok.startsWith('**')) parts.push(<b key={i++}>{tok.slice(2, -2)}</b>);
+    else if (tok.startsWith('`')) parts.push(<code key={i++}>{tok.slice(1, -1)}</code>);
+    else if (tok.startsWith('http')) {
+      parts.push(
+        <a key={i++} href={tok} target="_blank" rel="noreferrer noopener">
+          {tok.length > 60 ? `${tok.slice(0, 57)}…` : tok}
+        </a>,
+      );
+    } else parts.push(<i key={i++}>{tok.slice(1, -1)}</i>);
+    last = m.index + tok.length;
+  }
+  if (last < src.length) parts.push(src.slice(last));
+  return <>{parts}</>;
+}

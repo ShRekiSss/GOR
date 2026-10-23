@@ -6,6 +6,7 @@ import type { Env, UserRow } from './types';
 export interface User {
   id: number;
   username: string;
+  avatar?: string;
 }
 
 // PBKDF2-SHA256, 25 000 итераций — бесплатно по CPU и достаточно против оффлайн-брута.
@@ -99,11 +100,11 @@ export async function userByToken(env: Env, token: string): Promise<User | null>
   if (!token) return null;
   const now = Math.floor(Date.now() / 1000);
   const row = await env.DB.prepare(
-    `SELECT u.id, u.username FROM sessions s JOIN users u ON u.id = s.user_id
+    `SELECT u.id, u.username, u.avatar FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token = ? AND s.expires_at > ? LIMIT 1`,
-  ).bind(token, now).first<UserRow>();
+  ).bind(token, now).first<UserRow & { avatar?: string }>();
   if (!row) return null;
-  return { id: row.id, username: row.username };
+  return { id: row.id, username: row.username, avatar: row.avatar || '' };
 }
 
 // ---------- Лимитер (/api/auth/*): 20 попыток / 5 минут на IP ----------

@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL UNIQUE COLLATE NOCASE,
     password_hash TEXT NOT NULL,
+    avatar TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -49,6 +50,15 @@ CREATE TABLE IF NOT EXISTS messages (
     file_type TEXT,
     reply_to INTEGER NOT NULL DEFAULT 0,
     edited INTEGER NOT NULL DEFAULT 0
+);
+
+-- Реакции emoji на сообщения (Фаза 1): уникальный голос на юзера.
+CREATE TABLE IF NOT EXISTS reactions (
+    message_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    username TEXT NOT NULL DEFAULT '',
+    emoji TEXT NOT NULL,
+    PRIMARY KEY (message_id, user_id, emoji)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id);
 
