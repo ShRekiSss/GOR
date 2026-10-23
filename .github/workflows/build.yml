@@ -260,7 +260,6 @@ jobs:
           fi
 
       - name: Sign unsigned APK (иначе Android не разрешит установку)
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 == '' }}
         working-directory: desktop/src-tauri/gen/android
         run: |
           set -e
