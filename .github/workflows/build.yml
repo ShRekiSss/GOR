@@ -285,9 +285,10 @@ jobs:
           "$BT/apksigner" sign --ks "$KS" --ks-pass pass:vaksa-ci --key-pass pass:vaksa-ci \
             --out "$APK" "$APK.aligned" 2>&1
           "$BT/apksigner" verify "$APK"
-          mv "$APK" "VAKSA-universal.apk"
+          # Готовый файл кладём туда, где его ждёт upload-artifact (universal/**).
+          mv "$APK" "app/build/outputs/apk/universal/VAKSA-universal.apk"
           rm -f "$APK.aligned"
-          find app/build/outputs/apk -type f | head -10
+          find app/build/outputs/apk -type f -name '*.apk' | head -10
           echo "Готово: VAKSA-universal.apk (подписан ephemeral CI-ключом)"
 
       - uses: actions/upload-artifact@v4
@@ -310,7 +311,11 @@ jobs:
       - name: Collect APK
         run: |
           mkdir -p artifacts/apk
-          find artifacts/gor-android-apk -name '*.apk' -exec cp {} artifacts/apk/ \;
+          # Терпимый шаг: отсутствие артефакта не должно валить релиз (warning ниже).
+          find artifacts/gor-android-apk -type f -name '*.apk' -exec cp {} artifacts/apk/ \; 2>/dev/null || true
+          if [ -z "$(find artifacts/apk -name '*.apk' -print -quit 2>/dev/null)" ]; then
+            echo "::warning::APK-артефакт не найден — релиз выйдет без APK"
+          fi
           ls -la artifacts/apk
 
       - uses: softprops/action-gh-release@v2
