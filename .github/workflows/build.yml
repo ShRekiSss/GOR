@@ -280,20 +280,30 @@ jobs:
               exit 0
               ;;
           esac
-          KS=/tmp/vaksa-ci.jks
-          # ВАЖНО: и store-pass, и key-pass одинаковые — PKCS12 привязывает ключ к паролю хранилища.
-          keytool -genkeypair -v -keystore "$KS" -storepass vaksa-ci -keypass vaksa-ci \
-            -alias vaksa -keyalg RSA -keysize 2048 -validity 10950 \
-            -dname "CN=VAKSA, OU=GOR, O=VAKSA, C=RU" >/dev/null 2>&1
+          KS=/tmp/release-keystore.jks
+          # Настоящий ключ релиза (секрет ANDROID_KEYSTORE_BASE64) — чтобы новый APK
+          # ставился ПОВЕРХ старого (та же подпись, alias gor). Если секрета нет —
+          # ephemeral-ключ только для тестовых сборок.
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$KS"
+            KS_PASS="pass:gor_release_2026"
+            KS_ALIAS="gor"
+          else
+            keytool -genkeypair -v -keystore "$KS" -storepass vaksa-ci -keypass vaksa-ci \
+              -alias vaksa -keyalg RSA -keysize 2048 -validity 10950 \
+              -dname "CN=VAKSA, OU=GOR, O=VAKSA, C=RU" >/dev/null 2>&1
+            KS_PASS="pass:vaksa-ci"
+            KS_ALIAS="vaksa"
+          fi
           "$BT/zipalign" -f 4 "$APK" "$APK.aligned"
-          "$BT/apksigner" sign --ks "$KS" --ks-pass pass:vaksa-ci --key-pass pass:vaksa-ci \
+          "$BT/apksigner" sign --ks "$KS" --ks-pass "$KS_PASS" --ks-key-alias "$KS_ALIAS" --key-pass "$KS_PASS" \
             --out "$APK" "$APK.aligned" 2>&1
           "$BT/apksigner" verify "$APK"
           # Готовый файл кладём туда, где его ждёт upload-artifact (universal/**).
           mv "$APK" "app/build/outputs/apk/universal/VAKSA-universal.apk"
           rm -f "$APK.aligned"
           find app/build/outputs/apk -type f -name '*.apk' | head -10
-          echo "Готово: VAKSA-universal.apk (подписан ephemeral CI-ключом)"
+          echo "Готово: VAKSA-universal.apk (подписан релизным ключом)"
 
       - uses: actions/upload-artifact@v4
         with:
