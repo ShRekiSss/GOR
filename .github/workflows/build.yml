@@ -259,6 +259,37 @@ jobs:
             npx tauri android build --ci --apk --debug
           fi
 
+      - name: Sign unsigned APK (иначе Android не разрешит установку)
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 == '' }}
+        working-directory: desktop/src-tauri/gen/android
+        run: |
+          set -e
+          BT="$ANDROID_HOME/build-tools/34.0.0"
+          APK=$(find app/build/outputs/apk -name '*.apk' ! -name '*-idlib*' | head -1)
+          if [ -z "$APK" ]; then echo "::error::APK не найден"; exit 1; fi
+          echo "Найден APK: $APK"
+          case "$APK" in
+            *release-unsigned*)
+              :
+              ;;
+            *)
+              echo "APK уже подписан — пропускаем"
+              exit 0
+              ;;
+          esac
+          KS=/tmp/vaksa-ci.jks
+          keytool -genkeypair -v -keystore "$KS" -storepass vaksa-ci-store -keypass vaksa-ci-key \
+            -alias vaksa -keyalg RSA -keysize 2048 -validity 10950 \
+            -dname "CN=VAKSA, OU=GOR, O=VAKSA, C=RU" >/dev/null 2>&1
+          "$BT/zipalign" -f 4 "$APK" "$APK.aligned"
+          "$BT/apksigner" sign --ks "$KS" --ks-pass pass:vaksa-ci-store --key-pass pass:vaksa-ci-key \
+            --out "$APK" "$APK.aligned" 2>&1
+          "$BT/apksigner" verify "$APK"
+          mv "$APK" "VAKSA-universal.apk"
+          rm -f "$APK.aligned"
+          find app/build/outputs/apk -type f | head -10
+          echo "Готово: VAKSA-universal.apk (подписан ephemeral CI-ключом)"
+
       - uses: actions/upload-artifact@v4
         with:
           name: gor-android-apk

@@ -2067,3 +2067,150 @@ input {
   color: #6cc0ff;
   text-decoration: underline;
 }
+
+/* ============ Звонки (Discord-style) ============ */
+
+.call-button {
+  background: rgba(46, 166, 255, 0.08);
+  border: 1px solid rgba(46, 166, 255, 0.25);
+  border-radius: 10px;
+  color: #6cc0ff;
+  font-size: 17px;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+.call-button:hover { background: rgba(46, 166, 255, 0.2); }
+.call-button:active { transform: scale(0.94); }
+
+/* Полоса активного звонка */
+.call-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  background: linear-gradient(90deg, rgba(46, 166, 255, 0.14), rgba(30, 40, 52, 0.9));
+  border-bottom: 1px solid rgba(46, 166, 255, 0.25);
+  animation: callIn 0.25s ease;
+}
+@keyframes callIn {
+  from { transform: translateY(-100%); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+.call-wave {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #47c26a;
+  animation: callPulse 1.4s ease infinite;
+}
+.call-bar.outgoing .call-wave,
+.call-bar.connecting .call-wave {
+  background: #f0b429;
+}
+@keyframes callPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(71, 194, 106, 0.55); }
+  50% { box-shadow: 0 0 0 7px rgba(71, 194, 106, 0); }
+}
+.call-bar.outgoing .call-wave,
+.call-bar.connecting .call-wave {
+  animation-name: callPulseYellow;
+}
+@keyframes callPulseYellow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(240, 180, 41, 0.55); }
+  50% { box-shadow: 0 0 0 7px rgba(240, 180, 41, 0); }
+}
+
+.call-meta {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.call-meta strong {
+  font-size: 14px;
+  color: #e8f0f8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.call-meta span {
+  font-size: 12px;
+  color: #8fa6bb;
+  font-variant-numeric: tabular-nums;
+}
+
+.call-btn {
+  border: none;
+  border-radius: 50%;
+  width: 40px;
+  height: 40px;
+  font-size: 17px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  transition: transform 0.1s ease, filter 0.15s ease;
+}
+.call-btn:hover { filter: brightness(1.15); }
+.call-btn:active { transform: scale(0.92); }
+.call-btn.mute { background: rgba(255, 255, 255, 0.10); }
+.call-btn.mute.muted { background: rgba(240, 110, 90, 0.35); }
+.call-btn.accept { background: #2fa85a; }
+.call-btn.reject { background: #d64545; }
+
+/* Оверлей входящего звонка */
+.call-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 400;
+  background: rgba(10, 16, 24, 0.82);
+  backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.call-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 30px 42px;
+  border-radius: 18px;
+  background: #16202c;
+  border: 1px solid rgba(46, 166, 255, 0.3);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5);
+}
+.call-ring-anim {
+  width: 84px;
+  height: 84px;
+  border-radius: 50%;
+  background: rgba(46, 166, 255, 0.14);
+  border: 2px solid rgba(46, 166, 255, 0.5);
+  color: #6cc0ff;
+  font-size: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: ringWave 1.2s ease infinite;
+}
+@keyframes ringWave {
+  0% { box-shadow: 0 0 0 0 rgba(46, 166, 255, 0.5); }
+  70% { box-shadow: 0 0 0 26px rgba(46, 166, 255, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(46, 166, 255, 0); }
+}
+.call-name { font-size: 20px; color: #e8f0f8; }
+.call-sub { font-size: 13px; color: #8fa6bb; }
+.call-actions {
+  display: flex;
+  gap: 26px;
+  margin-top: 10px;
+}
+.call-actions .call-btn {
+  width: 56px;
+  height: 56px;
+  font-size: 22px;
+}

@@ -10,6 +10,7 @@ import {
   setServer,
 } from './server';
 import { authFetch, clearToken, getToken, setToken } from './auth';
+import { CallEngine } from './calls';
 
 // Порог мобильной (Android/PWA) раскладки — совпадает с CSS @media.
 const MOBILE_MQ = '(max-width: 820px)';
@@ -136,6 +137,11 @@ function App() {
   const [contextChat, setContextChat] = useState(null);
   const [composeOpen, setComposeOpen] = useState(false);
   const [toast, setToast] = useState('');
+  // --- Звонки (WebRTC, сигналинг через WS) ---
+  const [call, setCall] = useState(null); // {peer, direction, status, stream, muted}
+  const [callSecs, setCallSecs] = useState(0);
+  const callEngineRef = useRef(null);
+  const remoteAudioRef = useRef(null);
   const isMobileRef = useRef(isMobile);
   const layersRef = useRef([]); // стек «слоёв» для системной кнопки «назад»
   const gestureRef = useRef(null);
@@ -483,6 +489,11 @@ function App() {
             : m)));
           return;
         }
+        if (typeof incoming.type === 'string' && incoming.type.startsWith('call_')) {
+          // Сигналинг звонков (offer/answer/ice/hangup/busy/offline/decline).
+          callEngineRef.current?.handleSignal(incoming);
+          return;
+        }
 
         const message = incoming;
         if (!message.chatId) {
@@ -538,6 +549,10 @@ function App() {
       ws.onclose = () => {
         console.log('Disconnected from WebSocket');
         setIsConnected(false);
+        // Соединение с сервером умерло — звонок без сигналинга не имеет смысла.
+        if (callEngineRef.current?.peer) {
+          callEngineRef.current.hangup();
+        }
         if (closed) return;
         // Реконнект с нарастающей паузой: 0.5 c, 1 c, 2 c, 4 c … максимум 10 c.
         const delay = Math.min(10000, 500 * (2 ** retry));
@@ -1338,6 +1353,56 @@ function App() {
     toastTimerRef.current = setTimeout(() => setToast(''), 1800);
   };
 
+  // --- Звонки: движок живёт в ref, чтобы WS-эффект (который выше по коду)
+  // и UI могли дёргать его без проблем с зависимостями хуков. ---
+  const showToastRef = useRef(null);
+  showToastRef.current = showToast;
+
+  useEffect(() => {
+    callEngineRef.current = new CallEngine({
+      send: (frame) => {
+        const ws = wsRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+        try {
+          ws.send(JSON.stringify(frame));
+          return true;
+        } catch (e) {
+          return false;
+        }
+      },
+      onEvent: (state, toastMsg) => {
+        setCall(state);
+        if (toastMsg) showToastRef.current?.(toastMsg);
+        if (!state) setCallSecs(0);
+      },
+    });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Таймер длительности активного звонка (тик как у Discord).
+  const callKey = call
+    ? `${call.peer}|${call.status === 'active' ? 'active' : 'idle'}`
+    : 'idle';
+  useEffect(() => {
+    if (callKey === 'idle') return undefined;
+    if (callKey.endsWith('active')) {
+      setCallSecs(0);
+      const id = window.setInterval(() => setCallSecs((s) => s + 1), 1000);
+      return () => window.clearInterval(id);
+    }
+    return undefined;
+  }, [callKey]);
+
+  // Собеседник появился — подключаем его аудио.
+  useEffect(() => {
+    const el = remoteAudioRef.current;
+    if (el && call?.stream) {
+      el.srcObject = call.stream;
+      if (typeof el.play === 'function') {
+        el.play().catch(() => {});
+      }
+    }
+  }, [call?.stream, call?.status]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const openCompose = () => {
     setComposeOpen(true);
     if (isMobileRef.current) {
@@ -1947,12 +2012,59 @@ function App() {
                 : 'выберите чат или создайте новый'}
             </span>
           </div>
+          {activeChat?.type === 'direct' && (activeChat.peer || activeChat.title) && (
+            <button
+              type="button"
+              className="call-button"
+              onClick={() => {
+                if (callEngineRef.current?.pc) {
+                  showToast('Уже в звонке');
+                } else {
+                  callEngineRef.current?.start(activeChat.peer || activeChat.title);
+                }
+              }}
+              title="Голосовой звонок"
+            >
+              📞
+            </button>
+          )}
           {isDesktop() && server && (
             <span className="server-label" title={server}>
               {server.replace(/^https?:\/\//, '')}
             </span>
           )}
         </header>
+
+        {/* Полоса активного/исходящего звонка — как полоса Discord-звонка */}
+        {call && call.status !== 'ringing' && (
+          <div className={`call-bar ${call.status}`}>
+            <span className="call-wave" aria-hidden="true" />
+            <div className="call-meta">
+              <strong>@{call.peer}</strong>
+              <span>
+                {call.status === 'active'
+                  ? `${String(Math.floor(callSecs / 60)).padStart(2, '0')}:${String(callSecs % 60).padStart(2, '0')}`
+                  : call.status === 'outgoing' ? 'звоним…' : 'соединение…'}
+              </span>
+            </div>
+            <button
+              type="button"
+              className={`call-btn mute ${call.muted ? 'muted' : ''}`}
+              onClick={() => callEngineRef.current?.toggleMute()}
+              title={call.muted ? 'Включить микрофон' : 'Заглушить микрофон'}
+            >
+              {call.muted ? '🔇' : '🎙'}
+            </button>
+            <button
+              type="button"
+              className="call-btn reject"
+              onClick={() => callEngineRef.current?.hangup()}
+              title="Завершить звонок"
+            >
+              ✕
+            </button>
+          </div>
+        )}
 
         <div
           className={`messages-container ${isDragOver ? 'drag-over' : ''}`}
@@ -2433,6 +2545,37 @@ function App() {
       )}
 
       {toast && <div className="toast">{toast}</div>}
+
+      {/* Входящий звонок — оверлей поверх всего (Discord-style) */}
+      {call?.status === 'ringing' && (
+        <div className="call-overlay">
+          <div className="call-card">
+            <div className="call-ring-anim"><span>@</span></div>
+            <strong className="call-name">@{call.peer}</strong>
+            <span className="call-sub">входящий голосовой звонок…</span>
+            <div className="call-actions">
+              <button
+                type="button"
+                className="call-btn reject"
+                onClick={() => callEngineRef.current?.decline()}
+                title="Отклонить"
+              >
+                ✕
+              </button>
+              <button
+                type="button"
+                className="call-btn accept"
+                onClick={() => callEngineRef.current?.accept()}
+                title="Принять"
+              >
+                ✔
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Аудио собеседника: поток выводится вне DOM-разметки */}
+      <audio ref={remoteAudioRef} autoPlay style={{ display: 'none' }} />
     </div>
   );
 }

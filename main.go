@@ -986,6 +986,80 @@ func (h *Hub) sendToAll(v any) {
 	}
 }
 
+// ---------- Звонки (сигналинг WebRTC через WS) ----------
+// Сервер — тупой релей: берёт поле "to" (username адресата), добавляет
+// подлинные from/fromName и доставляет только ему. Ни БД, ни чаты не трогаем.
+// Типы: call_offer | call_answer | call_ice | call_decline | call_hangup |
+//       call_busy | call_ping… — любые call_*, клиент сам решает.
+const (
+	callMaxPayload = 64 << 10 // SDP/ICE не бывают больше 64 KiB
+)
+
+type callEnvelope struct {
+	Type string `json:"type"`
+	To   string `json:"to"`
+}
+
+// relayCall доставляет кадр call_* конкретному пользователю (по username).
+// Ответ "call_offline" уходит отправителю, если адресат не в сети.
+func (h *Hub) relayCall(from *Client, raw []byte) {
+	if len(raw) > callMaxPayload {
+		log.Printf("[%s] call-кадр слишком большой (%d байт)", from.username, len(raw))
+		return
+	}
+	var env callEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil || env.Type == "" {
+		return
+	}
+	to := strings.TrimSpace(env.To)
+	if to == "" || to == from.username {
+		return
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return
+	}
+	delete(payload, "to")
+	delete(payload, "chatId") // звонки не привязаны к чату
+	payload["from"] = from.userID
+	payload["fromName"] = from.username
+	payload["type"] = env.Type
+
+	var target *Client
+	h.mu.RLock()
+	for client := range h.clients {
+		if client.username == to {
+			target = client
+			break
+		}
+	}
+	h.mu.RUnlock()
+
+	if target == nil {
+		// Адресат не в сети — явно скажем об этом вызывающему.
+		select {
+		case from.send <- map[string]any{"type": "call_offline", "to": from.username, "fromName": to}:
+		default:
+		}
+		return
+	}
+
+	// Мульти-логин: доставим всем сокетам адресата (телефон + комп).
+	h.mu.RLock()
+	for client := range h.clients {
+		if client.username != to {
+			continue
+		}
+		select {
+		case client.send <- payload:
+		default:
+			// Медленный сокет пропускаем кадр — рингтон важнее вечности.
+		}
+	}
+	h.mu.RUnlock()
+}
+
 // ---------- Websocket ----------
 
 const (
@@ -1009,13 +1083,22 @@ func (c *Client) readPump() {
 	})
 
 	for {
-		var msg Message
-		err := c.conn.ReadJSON(&msg)
-		if err != nil {
+		var raw json.RawMessage
+		if err := c.conn.ReadJSON(&raw); err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("error: %v", err)
 			}
 			return
+		}
+		// Сигналинг звонков: точечная доставка, мимо чатов и БД.
+		if c.isCallFrame(raw) {
+			c.hub.relayCall(c, raw)
+			continue
+		}
+		var msg Message
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			log.Printf("[%s] битый кадр: %v", c.username, err)
+			continue
 		}
 		if msg.ChatID == 0 || !c.hub.db.IsMember(msg.ChatID, c.userID) {
 			log.Printf("[%s] попытка писать в чужой чат %d", c.username, msg.ChatID)
@@ -1026,6 +1109,18 @@ func (c *Client) readPump() {
 		msg.Timestamp = writeISO(time.Now())
 		c.hub.broadcast <- &msg
 	}
+}
+
+// isCallFrame быстро определяет, начинается ли кадр на call_ (SDP/ICE/управление).
+func (c *Client) isCallFrame(raw []byte) bool {
+	var probe struct {
+		Type string `json:"type"`
+		ChatID int64 `json:"chatId"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return false
+	}
+	return strings.HasPrefix(probe.Type, "call_") && probe.ChatID == 0
 }
 
 func (c *Client) writePump() {

@@ -88,6 +88,30 @@ export class Hub {
       return;
     }
 
+    // Сигналинг звонков (WebRTC через WS): точечная доставка по username.
+    // Кадры call_* не пишутся в БД и не растаскиваются по чатам.
+    if (typeof data?.type === 'string' && data.type.startsWith('call_')) {
+      const to = String(data.to || '').trim();
+      if (!to || to === s.username) return;
+      // Ограничение размера: SDP/candidate больше 32 KiB быть не может.
+      const raw = JSON.stringify(data);
+      if (raw.length > 64 * 1024) return;
+
+      const { to: _to, ...payload } = data as any;
+      const frame = { ...payload, from: s.userID, fromName: s.username, type: data.type };
+      let delivered = 0;
+      for (const [id, t] of this.sockets) {
+        if (t.username !== to || t.userID === 0) continue;
+        this.sendTo(id, t, frame);
+        delivered++;
+      }
+      // Адресат не в сети — сообщим вызывающему.
+      if (!delivered) {
+        this.sendTo(conID, s, { type: 'call_offline', fromName: s.username, toName: to });
+      }
+      return;
+    }
+
     // Обычное сообщение из чата: сохранить + разослать всем.
     if (data?.chatId && data?.type !== 'typing' && data?.type !== 'edit' && data?.type !== 'delete') {
       const f = {
