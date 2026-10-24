@@ -1993,6 +1993,14 @@ input {
   background: rgba(46, 166, 255, 0.12);
 }
 
+.conn-banner {
+  padding: 7px 14px;
+  font-size: 0.85rem;
+  color: #ffd08a;
+  background: rgba(255, 170, 60, 0.12);
+  border-bottom: 1px solid rgba(255, 170, 60, 0.35);
+}
+
 /* ---------- Реакции, ✓✓, аватарки, markdown ---------- */
 
 .react-row {

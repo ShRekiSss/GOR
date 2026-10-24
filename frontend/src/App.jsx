@@ -2123,6 +2123,13 @@ function App() {
           )}
         </header>
 
+        {/* Наглядно: пока нет связи — кнопки недоступны, и почему это так */}
+        {user && !isConnected && (
+          <div className="conn-banner">
+            ⌛ Нет связи с сервером — идёт переподключение. Кнопки и стикеры включатся сами, как только свяжусь.
+          </div>
+        )}
+
         {/* Поиск по чату: строка над лентой сообщений */}
         {activeChat && searchOpen && (
           <div className="chat-searchrow">
@@ -2283,8 +2290,15 @@ function App() {
           <div ref={messagesEndRef} />
         </div>
 
-        {stickerPanelOpen && activeChat && (
+        {stickerPanelOpen && (
           <div className="sticker-panel">
+            {!activeChat && (
+              <div className="giphy-loading">Сначала выбери чат слева — тогда стикеры уйдут адресату</div>
+            )}
+            {activeChat && stickerPacks.length === 0 && (
+              <div className="giphy-loading">Стикеры не загрузились — закрой и открой панель 🎨 ещё раз</div>
+            )}
+            {activeChat && stickerPacks.length > 0 && (<>
             <div className="sticker-panel-header">
               <div className="sticker-tabs">
                 {stickerPacks.map((pack) => (
@@ -2341,6 +2355,8 @@ function App() {
                   </button>
                 ))}
               </div>
+            )}
+            </>
             )}
           </div>
         )}
@@ -2465,6 +2481,13 @@ function App() {
             type="text"
             value={inputValue}
             onChange={handleInputChange}
+            onKeyDown={(e) => {
+              // На телефоне Enter по клавиатуре срабатывает случайно —
+              // пусть отправляет только кнопка SEND (на компе Enter шлёт).
+              if (e.key === 'Enter' && isMobileRef.current) {
+                e.preventDefault();
+              }
+            }}
             placeholder={activeChat ? '_' : 'Сначала выберите чат'}
             className="input-field"
             disabled={!isConnected || isUploading || !activeChatId}
@@ -2499,7 +2522,7 @@ function App() {
             disabled={!isConnected || isUploading || !activeChatId}
             className="send-button"
           >
-            SEND [ENTER]
+            SEND
           </button>
         </form>
       </main>
