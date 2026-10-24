@@ -41,9 +41,9 @@
 
 ```bash
 # 1) Скачай и распакуй сервер из Releases (gor-linux-amd64.tar.gz)
-tar -xzf gor-linux-amd64.tar.gz && cd gor
+tar -xzf gor-linux-amd64.tar.gz && cd gor-linux-amd64
 
-# 2) Запусти одной командой:
+# 2) Запусти одной командой (в архиве всё уже на своих местах):
 GOR_PORT=8080 GOR_DB=./chat.db GOR_UPLOADS=./uploads GOR_STATIC=./frontend/build ./gor
 ```
 

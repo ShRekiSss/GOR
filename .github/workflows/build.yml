@@ -36,7 +36,10 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
             -ldflags "-s -w -X main.version=${{ github.ref_name }}" \
             -o dist/gor-linux-amd64/gor .
-          cp -r frontend/build dist/gor-linux-amd64/
+          # Кладём статику как frontend/build — так ищет сервер по умолчанию
+          # (GOR_STATIC=./frontend/build) и как написано в README: скачал — запустил.
+          mkdir -p dist/gor-linux-amd64/frontend
+          cp -r frontend/build dist/gor-linux-amd64/frontend/build
           cp README.md dist/gor-linux-amd64/
           tar -C dist -czf gor-linux-amd64.tar.gz gor-linux-amd64
 
@@ -75,7 +78,8 @@ jobs:
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath \
             -ldflags "-s -w -X main.version=${{ github.ref_name }}" \
             -o dist/gor-windows-amd64/gor.exe .
-          cp -r frontend/build dist/gor-windows-amd64/
+          mkdir -p dist/gor-windows-amd64/frontend
+          cp -r frontend/build dist/gor-windows-amd64/frontend/build
           cp README.md dist/gor-windows-amd64/
           cd dist && powershell Compress-Archive -Path gor-windows-amd64 -DestinationPath ../gor-windows-amd64.zip
 
