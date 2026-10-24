@@ -19,7 +19,7 @@
 
 | Ты с телефона 📱 | Ты на винде 🪟 | Ты на линуксе 🐧 |
 |---|---|---|
-| `VAKSA-0.8.0-android.apk` — скачай, нажми «установить», разреши «из неизвестных источников» (программа твоя же, не бойся) | `VAKSA_0.8.0_x64-setup.exe` — обычный установщик. Лень ставить? Бери `gor-desktop.exe` — просто один файл, запустил и всё | `deb` — `sudo dpkg -i VAKSA_0.8.0_amd64.deb`. Не хочешь dpkg? `AppImage` — скачал, chmod +x, запустил |
+| `VAKSA-universal.apk` — скачай, нажми «установить», разреши «из неизвестных источников» (программа твоя же, не бойся) | `VAKSA_1.0.1_x64-setup.exe` — обычный установщик. Лень ставить? Бери `gor-desktop.exe` — просто один файл, запустил и всё | `deb` — `sudo dpkg -i VAKSA_1.0.1_amd64.deb`. Не хочешь dpkg? `AppImage` — скачал, chmod +x, запустил |
 
 Не получается установить APK? Открой сайт сервера в Chrome → меню (⋮) → **«Установить приложение»**. Это тот же мессенджер, просто ставится как сайт.
 
@@ -105,8 +105,10 @@ cd frontend && npm ci && npm run build
 # виндовс/линукс приложение
 cd desktop && npm ci && npx tauri build
 
-# андроид APK (SDK/NDK — один раз поставить)
-cd desktop && npx tauri android init --ci && npx tauri android build --ci --apk
+# андроид APK (SDK/NDK — один раз поставить; патч после init — микрофон для звонков)
+cd desktop && npx tauri android init --ci
+bash patch-android-permissions.sh
+npx tauri android build --ci --apk
 ```
 
 ---
