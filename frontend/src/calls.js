@@ -18,41 +18,65 @@ let ringNodes = null;
 
 function startRingLoop() {
   try {
-    if (ringCtx) return true;
-    ringCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const gain = ringCtx.createGain();
-    gain.gain.value = 0.0;
-    gain.connect(ringCtx.destination);
-    // Мигание: два коротких писка каждые 2 секунды.
-    const osc = ringCtx.createOscillator();
-    osc.type = 'sine';
-    osc.frequency.value = 440;
-    osc.connect(gain);
-    osc.start();
-    const on = () => {
-      const t = ringCtx.currentTime;
-      gain.gain.cancelScheduledValues(t);
-      gain.gain.setValueAtTime(0.0, t);
-      gain.gain.linearRampToValueAtTime(0.18, t + 0.03);
-      gain.gain.setValueAtTime(0.18, t + 0.35);
-      gain.gain.linearRampToValueAtTime(0.0, t + 0.4);
-      gain.gain.setValueAtTime(0.0, t + 0.45);
-      gain.gain.linearRampToValueAtTime(0.18, t + 0.5);
-      gain.gain.setValueAtTime(0.18, t + 0.85);
-      gain.gain.linearRampToValueAtTime(0.0, t + 0.9);
-    };
-    on();
-    ringNodes = { osc, gain, timer: setInterval(on, 2000) };
-    return true;
+    if (!ringCtx) {
+      ringCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const gain = ringCtx.createGain();
+      gain.gain.value = 0.0;
+      gain.connect(ringCtx.destination);
+      // Мигание: два коротких писка каждые 2 секунды.
+      const osc = ringCtx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = 440;
+      osc.connect(gain);
+      osc.start();
+      const on = () => {
+        const t = ringCtx.currentTime;
+        gain.gain.cancelScheduledValues(t);
+        gain.gain.setValueAtTime(0.0, t);
+        gain.gain.linearRampToValueAtTime(0.18, t + 0.03);
+        gain.gain.setValueAtTime(0.18, t + 0.35);
+        gain.gain.linearRampToValueAtTime(0.0, t + 0.4);
+        gain.gain.setValueAtTime(0.0, t + 0.45);
+        gain.gain.linearRampToValueAtTime(0.18, t + 0.5);
+        gain.gain.setValueAtTime(0.18, t + 0.85);
+        gain.gain.linearRampToValueAtTime(0.0, t + 0.9);
+      };
+      on();
+      ringNodes = { osc, gain, timer: setInterval(on, 2000) };
+    }
   } catch (e) {
     console.warn('ringtone:', e);
+    ringCtx = null;
+    ringNodes = null;
     return false;
   }
+  // Android (WebView/PWA): без пользовательского жеста контекст приходит
+  // suspended — надо resume(), иначе узлы «играют» в пустоту.
+  if (ringCtx.state === 'suspended') {
+    ringCtx.resume().catch(() => { /* жест ещё не был — ждём */ });
+  }
+  // Пока звук реально не идёт (контекст suspended) — дублируем вибро тактом,
+  // чтобы входящий всё-таки ощущается без апгрейда жеста.
+  const audible = ringCtx.state === 'running';
+  if (ringNodes && !audible) {
+    try {
+      ringNodes.vibrateTimer = setInterval(() => {
+        if (ringCtx && ringCtx.state === 'running') return; // звук заработал
+        navigator.vibrate?.([300, 150, 300, 150, 300, 500, 300]);
+      }, 2000);
+    } catch { /* нет вибрации */ }
+  }
+  // Первый такт — сразу, пока звук ещё suspended.
+  if (!audible) {
+    try { navigator.vibrate?.([300, 150, 300, 150, 300, 500, 300]); } catch { /* нет vibrate */ }
+  }
+  return audible;
 }
 
 function stopRingLoop() {
   if (!ringNodes) return;
   clearInterval(ringNodes.timer);
+  if (ringNodes.vibrateTimer) clearInterval(ringNodes.vibrateTimer);
   try {
     ringNodes.osc.stop();
     ringNodes.gain.disconnect();
@@ -95,8 +119,11 @@ export class CallEngine {
 
   // --- Исходящий звонок: getUserMedia + offer сразу (Discord-семантика быстрая) ---
   async start(peer) {
-    if (!peer || this.pc) {
-      this.emit(this.currentState(), this.pc ? 'Уже в звонке' : '');
+    if (!peer) return;
+    // Входящий в ringing не создаёт pc — поэтому одного this.pc мало:
+    // иначе исходящий вызов молча затирает входящий.
+    if (this.pc || this.pendingOffer || this.status === 'ringing') {
+      this.emit(this.currentState(), 'Сначала завершите текущий звонок');
       return;
     }
     this.peer = peer;
@@ -211,8 +238,8 @@ export class CallEngine {
   handleSignal(ev) {
     switch (ev.type) {
       case 'call_offer': {
-        if (this.pc) {
-          // Занято — автоответ.
+        if (this.pc || this.status === 'outgoing') {
+          // Занято (звонок активен или исходящий уже в работе) — автоответ.
           this.sendSignal({ type: 'call_busy', to: ev.fromName });
           return;
         }
@@ -257,8 +284,11 @@ export class CallEngine {
           if (!cand) return;
           if (this.pc && this.iceOpen) {
             this.pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
-          } else if (this.pc) {
-            this.queueIce.push(cand);
+          } else {
+            // pc ещё нет (входящий в ringing: pc создаётся в accept()) или
+            // setRemoteDescription не готов — буферизуем ВСЕГДА, очередь
+            // сливается сразу после setRemote в accept()/call_answer.
+            if (this.queueIce.length < 64) this.queueIce.push(cand);
           }
         } catch (e) { console.warn('ice:', e); }
         return;
