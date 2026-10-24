@@ -1944,6 +1944,55 @@ input {
   background: rgba(224, 87, 74, 0.14);
 }
 
+/* ---------- Черновики, пересылка, поиск по чату (ТГ-стиль) ---------- */
+
+.forward-chatlist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 46vh;
+  overflow-y: auto;
+}
+
+.msg-menu .forward-chatlist button {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-searchrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: #0e1216;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.chat-searchrow .call-button {
+  font-size: 0.9rem;
+}
+
+.chat-searchinput {
+  flex: 1;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #17212b;
+  color: #e7eefb;
+  font-size: 0.95rem;
+  outline: none;
+}
+
+.chat-searchinput:focus {
+  border-color: rgba(46, 166, 255, 0.55);
+}
+
+.call-button.search-on {
+  color: #2ea6ff;
+  background: rgba(46, 166, 255, 0.12);
+}
+
 /* ---------- Реакции, ✓✓, аватарки, markdown ---------- */
 
 .react-row {

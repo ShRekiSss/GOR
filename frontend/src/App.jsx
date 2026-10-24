@@ -58,6 +58,10 @@ function App() {
   const [replyTo, setReplyTo] = useState(null);
   const [editingMsg, setEditingMsg] = useState(null);
   const [msgMenu, setMsgMenu] = useState(null);
+  // ТГ-стиль: черновик сохраняется при прыжке между чатами, пересылка, поиск.
+  const [forwardMsg, setForwardMsg] = useState(null);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [chatSearch, setChatSearch] = useState('');
   const [typingUser, setTypingUser] = useState('');
   // Реакции: { [msgId]: [{emoji, count, usernames}] }.
   const [reactions, setReactions] = useState({});
@@ -386,11 +390,16 @@ function App() {
   }, [messages]);
 
   // Сообщения с разделителями дней (Сегодня / Вчера / дата), как в мессенджерах.
+  // Плюс поиск по чату: при активном запросе рендерим только попадания.
+  const inChatQuery = chatSearch.trim().toLowerCase();
+  const visibleMessages = inChatQuery
+    ? messages.filter((m) => (m.text || '').toLowerCase().includes(inChatQuery))
+    : messages;
   const renderedMessages = [];
-  if (messages.length) {
+  if (visibleMessages.length) {
     let lastDay = null;
     let fallbackKey = 0;
-    messages.forEach((msg) => {
+    visibleMessages.forEach((msg) => {
       const date = parseTs(msg.timestamp);
       if (date) {
         const key = dayKey(date);
@@ -822,8 +831,24 @@ function App() {
 
   const activeStickerPack = stickerPacks.find((pack) => pack.id === activePack);
 
+  const readDraft = (chatId) => {
+    if (!chatId) return '';
+    try {
+      return localStorage.getItem(`draft-${chatId}`) || '';
+    } catch { /* нет localStorage — живём без черновиков */ }
+    return '';
+  };
+
   const handleInputChange = (e) => {
-    setInputValue(e.target.value);
+    const val = e.target.value;
+    setInputValue(val);
+    // Черновик (как в ТГ): пишешь — сразу в стор, чтобы прыжок между чатами не терял текст.
+    if (activeChatId && !editingMsg) {
+      try {
+        if (val) localStorage.setItem(`draft-${activeChatId}`, val);
+        else localStorage.removeItem(`draft-${activeChatId}`);
+      } catch { /* нет localStorage — живём без черновиков */ }
+    }
     // «Печатает…» — не чаще раза в 2.5 секунды.
     const now = Date.now();
     if (
@@ -848,6 +873,9 @@ function App() {
       wsRef.current.send(JSON.stringify({ type: 'edit', messageId: editingMsg.id, text: inputValue }));
       setEditingMsg(null);
       setInputValue('');
+      if (activeChatId) {
+        try { localStorage.removeItem(`draft-${activeChatId}`); } catch { /* ок */ }
+      }
       return;
     }
 
@@ -864,6 +892,29 @@ function App() {
     wsRef.current.send(JSON.stringify(message));
     setInputValue('');
     setReplyTo(null);
+    // Черновик отправлен — из стора его прочь.
+    if (activeChatId) {
+      try { localStorage.removeItem(`draft-${activeChatId}`); } catch { /* ок */ }
+    }
+  };
+
+  // Пересылка (как в ТГ): копия сообщения уходит выбранным чатам.
+  const doForward = (targetChatId) => {
+    if (!forwardMsg) return;
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      showToast('Нет связи с сервером');
+      return;
+    }
+    const message = {
+      chatId: targetChatId,
+      username: username,
+      text: `⤵ от @${forwardMsg.username}: ${forwardMsg.text}`,
+      type: 'text',
+      forwardedFrom: forwardMsg.username || '',
+    };
+    wsRef.current.send(JSON.stringify(message));
+    showToast(targetChatId === activeChatId ? 'Переслано' : 'Переслано в другой чат');
+    setForwardMsg(null);
   };
 
   const handleStickerButtonClick = () => {
@@ -1159,7 +1210,26 @@ function App() {
     layersRef.current = [];
   };
 
+  // Черновик: при любом переходе чата (кнопкой, автоподключением, перелогином)
+  // поле ввода = сохранённому черновику этого чата (как в ТГ).
+  useEffect(() => {
+    setInputValue(readDraft(activeChatId));
+  }, [activeChatId]);
+
   const selectChat = (chatId) => {
+    // Черновик (как в ТГ): уходя с чата — сохраняем недописанное ему, входя — восстанавливаем.
+    if (activeChatId && !editingMsg) {
+      try {
+        // В режиме правки текст в поле — не черновик, его не трогаем.
+        if (inputValue) localStorage.setItem(`draft-${activeChatId}`, inputValue);
+        else localStorage.removeItem(`draft-${activeChatId}`);
+      } catch { /* ок */ }
+    }
+    // Режимы ответа/правки/поиска принадлежат чату, а не окну.
+    setReplyTo(null);
+    setEditingMsg(null);
+    setSearchOpen(false);
+    setChatSearch('');
     setActiveChatId(chatId);
     setSidebarOpen(false);
     if (isMobileRef.current) {
@@ -2015,6 +2085,21 @@ function App() {
                 : 'выберите чат или создайте новый'}
             </span>
           </div>
+          {activeChat && (
+            <button
+              type="button"
+              className={`call-button ${searchOpen ? 'search-on' : ''}`}
+              onClick={() => {
+                setSearchOpen((v) => {
+                  if (v) setChatSearch('');
+                  return !v;
+                });
+              }}
+              title="Поиск по чату"
+            >
+              🔍
+            </button>
+          )}
           {activeChat?.type === 'direct' && (activeChat.peer || activeChat.title) && (
             <button
               type="button"
@@ -2037,6 +2122,28 @@ function App() {
             </span>
           )}
         </header>
+
+        {/* Поиск по чату: строка над лентой сообщений */}
+        {activeChat && searchOpen && (
+          <div className="chat-searchrow">
+            <input
+              autoFocus
+              type="text"
+              value={chatSearch}
+              onChange={(e) => setChatSearch(e.target.value)}
+              placeholder="Найти в этом чате…"
+              className="chat-searchinput"
+            />
+            <button
+              type="button"
+              className="call-button"
+              onClick={() => { setSearchOpen(false); setChatSearch(''); }}
+              title="Закрыть поиск"
+            >
+              ✕
+            </button>
+          </div>
+        )}
 
         {/* Полоса активного/исходящего звонка — как полоса Discord-звонка */}
         {call && call.status !== 'ringing' && (
@@ -2089,6 +2196,12 @@ function App() {
             <div className="welcome-message">
               &gt; Начало диалога {activeChat.type === 'group' ? 'в группе' : 'с пользователем'} {activeChat.title || activeChat.peer}<br />
               &gt; Напишите первое сообщение
+            </div>
+          )}
+          {activeChat && inChatQuery && messages.length > 0 && visibleMessages.length === 0 && (
+            <div className="welcome-message">
+              &gt; Ничего не найдено: «{chatSearch.trim()}»<br />
+              &gt; Поиск идёт только по загруженной истории чата
             </div>
           )}
           {loadingOlder && <div className="history-loading">загрузка истории…</div>}
@@ -2190,7 +2303,7 @@ function App() {
                   type="text"
                   value={giphyQuery}
                   onChange={(e) => setGiphyQuery(e.target.value)}
-                  placeholder="Search GIPHY..."
+                  placeholder="Поиск GIF…"
                   className="giphy-input"
                 />
                 <button type="button" onClick={searchGiphy} className="giphy-search-btn">
@@ -2200,7 +2313,7 @@ function App() {
             </div>
 
             {giphyError && <div className="giphy-error">{giphyError}</div>}
-            {isGiphyLoading && <div className="giphy-loading">Loading GIFs...</div>}
+            {isGiphyLoading && <div className="giphy-loading">Ищу GIF…</div>}
 
             <div className="sticker-grid">
               {activeStickerPack?.stickers?.map((sticker) => (
@@ -2280,6 +2393,11 @@ function App() {
                   ↩ Ответить
                 </button>
               )}
+              {msgMenu.type === 'text' && msgMenu.text && msgMenu.username !== 'System' && (
+                <button type="button" onClick={() => { setForwardMsg(msgMenu); setMsgMenu(null); }}>
+                  ⤵ Переслать
+                </button>
+              )}
               {msgMenu.userId === user?.id
                 && !['deleted', 'file', 'sticker'].includes(msgMenu.type)
                 && msgMenu.username !== 'System' && (
@@ -2317,6 +2435,26 @@ function App() {
                   ⧉ Копировать
                 </button>
               )}
+            </div>
+          </div>
+        )}
+
+        {/* Пересылка: выбор чата, куда уйти копия (как в ТГ) */}
+        {forwardMsg && (
+          <div className="msg-menu-overlay" onClick={() => setForwardMsg(null)}>
+            <div className="msg-menu" onClick={(e) => e.stopPropagation()}>
+              <div className="msg-menu-preview">
+                <b>⤵ Переслать</b>: {(forwardMsg.text || '').slice(0, 90)}
+              </div>
+              <div className="forward-chatlist">
+                {chats.map((c) => (
+                  <button key={c.id} type="button" onClick={() => doForward(c.id)}>
+                    {c.type === 'group' ? '# ' : '@ '}
+                    {c.title || c.peer || c.id}
+                  </button>
+                ))}
+                {!chats.length && <div className="msg-menu-preview">Нет чатов для пересылки</div>}
+              </div>
             </div>
           </div>
         )}

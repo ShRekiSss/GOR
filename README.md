@@ -47,16 +47,10 @@ tar -xzf gor-linux-amd64.tar.gz && cd gor
 GOR_PORT=8080 GOR_DB=./chat.db GOR_UPLOADS=./uploads GOR_STATIC=./frontend/build ./gor
 ```
 
-Готово. Сервер работает. Теперь надо чтоб наружу был виден:
+Готово. Сервер работает. Теперь надо, чтоб наружу был виден:
 
-- Есть домен? → прокинь nginx/caddy на порт 8080 и радуйся https.
-- Лень возиться? → туннель одной строкой из коробки:
-
-```bash
-ssh -R 80:127.0.0.1:8080 nokey@localhost.run
-```
-
-Выведет адрес типа `https://random.lhr.life` — его и вписывай в клиент.
+- **Есть домен и машина дома?** → Cloudflare Tunnel: постоянный адрес, готовый HTTPS и никаких открытых портов — конфиг готов: [deploy/cloudflared-config.yml](deploy/cloudflared-config.yml)
+- **Железа нет вообще?** → «вечно бесплатный» сервер на Oracle Cloud, 0 ₽/мес — полный гайд: [deploy/ORACLE.md](deploy/ORACLE.md)
 
 Проверка что сервер жив: открой `http://адрес:8080/api/health` → должно показать `{"status":"ok", ...}`.
 
