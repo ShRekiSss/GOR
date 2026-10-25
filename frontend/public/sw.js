@@ -82,3 +82,43 @@ self.addEventListener('fetch', (event) => {
     )
   );
 });
+
+// ---------- Web Push (Milestone 2) ----------
+self.addEventListener('push', (event) => {
+  let data = null;
+  try {
+    data = event.data ? event.data.json() : null;
+  } catch (e) {
+    data = null;
+  }
+  const title = (data && data.title) || 'VAKSA';
+  const body = (data && data.body) || 'Новое событие в чате';
+  const chatId = (data && data.chatId) || 0;
+  event.waitUntil(
+    self.registration.showNotification(title, {
+      body,
+      tag: data && data.type === 'call' ? 'vaksa-call' : `vaksa-msg-${chatId}`,
+      renotify: data && data.type === 'call',
+      icon: '/icons/icon-192.png',
+      badge: '/icons/icon-192.png',
+      data: { chatId, url: chatId ? `/?chat=${chatId}` : '/' },
+    })
+  );
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const target = (event.notification.data && event.notification.data.url) || '/';
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
+      for (const client of list) {
+        if ('focus' in client) {
+          client.focus();
+          try { client.postMessage({ type: 'open-chat', url: target }); } catch (e) { /* нет канала */ }
+          return;
+        }
+      }
+      return self.clients.openWindow(target);
+    })
+  );
+});

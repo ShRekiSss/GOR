@@ -60,6 +60,22 @@ CREATE TABLE IF NOT EXISTS reactions (
     emoji TEXT NOT NULL,
     PRIMARY KEY (message_id, user_id, emoji)
 );
+
+-- Web Push: подписки устройств и VAPID-ключи (Milestone 2).
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    endpoint TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_push_sub_user ON push_subscriptions(user_id);
+
+CREATE TABLE IF NOT EXISTS push_state (
+    k TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id);
 
 -- Общий чат существует всегда.

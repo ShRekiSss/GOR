@@ -5,6 +5,7 @@ import {
   User, USERNAME_RE, createSession, hashPassword, rateLimitAuth, tokenFromRequest, userByToken, verifyPassword,
 } from './auth';
 import { text } from './index';
+import { sendPush, pushPublicKey } from './push';
 
 // In-memory: кэш GIPHY-поиска на изолят + лимит поиска (троттлинг на юзера × минуту).
 const giphyCache = new Map<string, { items: { id: string; url: string; title: string }[]; t: number }>();
@@ -186,6 +187,44 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
     })).filter((g) => g.url);
     giphyCache.set(gkey, { items, t: Date.now() });
     return json({ data: items });
+  }
+
+  // ---------- Web Push (Milestone 2) ----------
+  // Публичный VAPID-ключ (applicationServerKey) для подписки браузера.
+  if (path === '/api/push/pubkey' && req.method === 'GET') {
+    return json({ publicKey: await pushPublicKey(env) });
+  }
+
+  // Подписка устройства: { endpoint, keys: { p256dh, auth } }.
+  if (path === '/api/push/subscribe' && req.method === 'POST') {
+    let body: { endpoint?: string; keys?: { p256dh?: string; auth?: string } };
+    try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
+    const endpoint = String(body.endpoint || '');
+    const p256dh = String(body.keys?.p256dh || '');
+    const auth = String(body.keys?.auth || '');
+    if (!endpoint.startsWith('https://') || !p256dh || !auth) {
+      return text('Некорректная подписка', 400);
+    }
+    if (endpoint.length > 1024 || p256dh.length > 200 || auth.length > 40) {
+      return text('Слишком длинные данные подписки', 400);
+    }
+    await env.DB.prepare(
+      `INSERT INTO push_subscriptions (endpoint, user_id, p256dh, auth) VALUES (?, ?, ?, ?)
+       ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth`,
+    ).bind(endpoint, user.id, p256dh, auth).run();
+    return new Response(null, { status: 201 });
+  }
+
+  // Отписка устройства (SW делает её сам по pushsubscriptionchange тоже).
+  if (path === '/api/push/unsubscribe' && req.method === 'POST') {
+    let body: { endpoint?: string };
+    try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
+    const endpoint = String(body.endpoint || '');
+    if (!endpoint) return text('Некорректный запрос', 400);
+    await env.DB.prepare(
+      'DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?',
+    ).bind(endpoint, user.id).run();
+    return new Response(null, { status: 204 });
   }
 
   if (path === '/api/users' && req.method === 'GET') {

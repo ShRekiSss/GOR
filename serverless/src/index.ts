@@ -48,9 +48,7 @@ async function handle(req: Request, envRaw: Env): Promise<Response> {
   // WS-хаб: прямая передача апгрейда в DO.
   if (path === '/ws') {
     const stub = env.HUB.get(env.HUB.idFromName('hub'));
-    const resp = await stub.fetch(req);
-    for (const [k, v] of Object.entries(cors)) if (!resp.headers.has(k)) resp.headers.set(k, v);
-    return resp;
+    return stub.fetch(req);
   }
 
   // API и файлы (единая логика в api.ts)
@@ -61,14 +59,31 @@ async function handle(req: Request, envRaw: Env): Promise<Response> {
     } catch (e: any) {
       resp = text(`Внутренняя ошибка: ${e?.message || e}`, 500);
     }
-    for (const [k, v] of Object.entries(cors)) if (!resp.headers.has(k)) resp.headers.set(k, v);
-    return resp;
+    return withCors(resp, cors);
   }
 
   // Всё остальное — статика PWA (SPA-фолбэк в [assets]).
   const assetsResp = await env.ASSETS.fetch(req);
-  for (const [k, v] of Object.entries(cors)) if (!assetsResp.headers.has(k)) assetsResp.headers.set(k, v);
-  return assetsResp;
+  return withCors(assetsResp, cors);
+}
+
+// Записать CORS-заголовки как можно мягче. Ответы от сабреквестов (DO, ASSETS,
+// внешние fetch) приходят с иммутабельными заголовками — до тихого set() падает
+// TypeError и роняет весь запрос (в т.ч. WS-апгрейд и auth). Падение — чиним
+// пересборкой Response с копией заголовков, они уже доступны в мутабельном виде.
+function withCors(resp: Response, cors: Record<string, string>): Response {
+  try {
+    for (const [k, v] of Object.entries(cors)) if (!resp.headers.has(k)) resp.headers.set(k, v);
+    return resp;
+  } catch {
+    const out = new Response(resp.body, {
+      status: resp.status,
+      statusText: resp.statusText,
+      headers: new Headers(resp.headers),
+    });
+    for (const [k, v] of Object.entries(cors)) if (!out.headers.has(k)) out.headers.set(k, v);
+    return out;
+  }
 }
 
 export function text(message: string, status: number): Response {

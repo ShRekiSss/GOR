@@ -11,6 +11,7 @@ import {
 } from './server';
 import { authFetch, clearToken, getToken, setToken } from './auth';
 import { CallEngine } from './calls';
+import { pushEnable, pushDisable, pushState, initPushRouting } from './app-push';
 
 // Порог мобильной (Android/PWA) раскладки — совпадает с CSS @media.
 const MOBILE_MQ = '(max-width: 820px)';
@@ -130,6 +131,8 @@ function App() {
   const [groupMembers, setGroupMembers] = useState([]);
   const [chatError, setChatError] = useState('');
   const [autostart, setAutostart] = useState(false);
+  // Web Push: поддержан ли браузером и включён ли (для тумблера в настройках).
+  const [pushInfo, setPushInfo] = useState({ supported: false, on: false, busy: false });
 
   // --- Мобильный режим (Android/PWA): жесты в стиле Signal-Android ---
   const [isMobile, setIsMobile] = useState(() => window.matchMedia(MOBILE_MQ).matches);
@@ -424,6 +427,20 @@ function App() {
     if (!user || (isDesktop() && !server)) {
       return undefined;
     }
+
+    // Пуш: узнаём состояние тумблера (+ роутинг кликов по нотификациям).
+    (async () => {
+      const info = await pushState(getToken(), getServer() || '');
+      setPushInfo((prev) => ({ ...prev, supported: info.supported, on: info.on }));
+    })();
+    initPushRouting((chatId) => {
+      if (chatId) {
+        loadChats(chatId).catch(() => {});
+        if (isMobileRef.current) {
+          setMobileChatOpen(true);
+        }
+      }
+    });
 
     let closed = false;
     let retry = 0;
@@ -1411,6 +1428,28 @@ function App() {
       }
     } catch (error) {
       console.error('autostart toggle:', error);
+    }
+  };
+
+  // Вкл/выкл Web Push: подписка в SW + учётная запись на сервере.
+  const togglePush = async (on) => {
+    const token = getToken();
+    if (!token) return;
+    setPushInfo((prev) => ({ ...prev, busy: true }));
+    try {
+      if (on) {
+        await pushEnable(token, getServer() || '');
+        setPushInfo((prev) => ({ ...prev, on: true }));
+        showToast('Уведомления включены — пуши полетят, когда офлайн');
+      } else {
+        await pushDisable(token, getServer() || '');
+        setPushInfo((prev) => ({ ...prev, on: false }));
+        showToast('Уведомления выключены');
+      }
+    } catch (error) {
+      showToast(`Пуш не завёлся: ${error.message}`);
+    } finally {
+      setPushInfo((prev) => ({ ...prev, busy: false }));
     }
   };
 
@@ -2497,16 +2536,16 @@ function App() {
             onClick={() => fileInputRef.current?.click()}
             disabled={!isConnected || isUploading || !activeChatId}
             className="file-button"
-            title="Прикрепить файл"
+            title="Прикрепить фейлы (не скрывать, всё честно)"
           >
-            📎 FILE
+            📎 фейлы
           </button>
           <button
             type="button"
             onClick={handleStickerButtonClick}
             disabled={!isConnected || isUploading || !activeChatId}
             className={`sticker-button ${stickerPanelOpen ? 'active' : ''}`}
-            title="Стикеры"
+            title="Спец с ошипкой (стикеры)"
           >
             🎨
           </button>
@@ -2521,8 +2560,9 @@ function App() {
             type="submit"
             disabled={!isConnected || isUploading || !activeChatId}
             className="send-button"
+            title="Атправить (с ашипкай — типо мем)"
           >
-            SEND
+            отправить
           </button>
         </form>
       </main>
@@ -2641,6 +2681,18 @@ function App() {
               <label className="settings-check">
                 <input type="checkbox" checked={autostart} onChange={toggleAutostart} />
                 Запускать при входе в систему
+              </label>
+            )}
+
+            {pushInfo.supported && (
+              <label className="settings-check">
+                <input
+                  type="checkbox"
+                  checked={pushInfo.on}
+                  disabled={pushInfo.busy}
+                  onChange={(e) => togglePush(e.target.checked)}
+                />
+                Уведомления, когда офлайн
               </label>
             )}
 

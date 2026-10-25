@@ -4,6 +4,7 @@
 
 import type { Env, Frame } from './types';
 import { userByToken } from './auth';
+import { sendPush } from './push';
 
 export class Hub {
   state: DurableObjectState;
@@ -128,6 +129,14 @@ export class Hub {
       // Адресат не в сети — сообщим вызывающему.
       if (!delivered) {
         this.sendTo(conID, s, { type: 'call_offline', fromName: s.username, toName: to });
+        if (data.type === 'call_invite') {
+          try {
+            const uid = await this.env.DB.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE').bind(to).first<{ id: number }>().catch(() => null);
+            if (uid?.id) {
+              await sendPush(this.env, uid.id, { type: 'call', title: 'VAKSA', body: `Входящий звонок от ${s.username}`, chatId: 0 });
+            }
+          } catch { /* пуш не важнее звонка */ }
+        }
       }
       return;
     }
@@ -154,6 +163,18 @@ export class Hub {
       } as Frame;
       const saved = await saveAndBroadcast(this.env, f);
       await this.broadcast(saved);
+      // Пуш тем участникам, кого нет на WS (офлайн): таблица push_subscriptions.
+      try {
+        if (f.type === 'text' || f.type === 'file' || f.type === 'sticker') {
+          const mem = await this.members(chatID);
+          const online = new Set<number>();
+          for (const [, t] of this.sockets) if (t.userID) online.add(t.userID);
+          for (const uid of mem) {
+            if (uid === s.userID || online.has(uid)) continue; // автор и онлайны уже в курсе
+            await sendPush(this.env, uid, { type: 'message', chatId: f.chatId, title: 'VAKSA', body: `Новое сообщение от ${s.username}` });
+          }
+        }
+      } catch { /* пуш не блокирует доставку */ }
       return;
     }
 
