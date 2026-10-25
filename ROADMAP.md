@@ -17,13 +17,13 @@
 - Стикеры: раскраска GIPHY-прокси уже есть, добавить загрузку своих (в D1)
 - Экспорт истории чата (JSON/текст)
 
-## Фаза 2 — «Голос» (killer-фича уровня Discord/Telegram) — след. цель
-- Сигналинг через существующий WS: `call_invite / call_offer / call_answer / call_ice / call_hangup / call_busy`
-- WebRTC 1:1 звонок (P2P, Opus/VP8): ringing UI, mute/speaker
-- TURN (coturn) рядом с сервером — обязательный NAT traversal
-- Групповые звонки через SFU (self-host LiveKit, docker-compose): комнаты как каналы, вход/выход одним тапом
-- Скриншаринг (displayMedia), mute любого, переключение камеры
-- Android: фоновый звонок (foreground service), рингтон/вибро (права уже в манифесте)
+## Фаза 2 — «Голос» (killer-фича уровня Discord/Telegram) — 1:1 сделан, остальное дальше
+- ✅ Сигналинг через существующий WS: `call_*` (invite/answer/decline/busy/offline/hangup) — проверено вживую на vaksa.space
+- ✅ WebRTC 1:1 звонок: UI — кнопка 📞 в шапке, полоса звонка с таймером, оверлей входящего, рингтон WebAudio+vibro, mute; движок `frontend/src/calls.js`
+- ⬜ TURN (coturn) рядом с сервером — обязательный NAT traversal (для строгих NAT на мобильных операторах)
+- ⬜ Групповые звонки через SFU (self-host LiveKit): комнаты как каналы, вход/выход одним тапом
+- ⬜ Скриншаринг (displayMedia), mute любого, переключение камеры
+- ⬜ Android: фоновый звонок (foreground service), рингтон в фоне
 
 ## Фаза 3 — «Доверие» (безопасность)
 - E2E-шифрование текста (X3DH + Double Ratchet: libsodium JS / Rust в Tauri)
