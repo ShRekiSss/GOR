@@ -9,12 +9,32 @@ export class Hub {
   state: DurableObjectState;
   env: Env;
   sockets = new Map<number, { ws: WebSocket; userID: number; username: string }>();
+  // Кэш состава участников чата: privacy — чужие кадры не получают и писать не могут.
+  memberCache = new Map<number, { users: Set<number>; t: number }>();
   seq = 1;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
   }
+
+  // Участники чата с TTL 60 сек; при сбое БД — пустое множество (fail-closed).
+  private async members(chatID: number): Promise<Set<number>> {
+    const cached = this.memberCache.get(chatID);
+    const now = Date.now();
+    if (cached && now - cached.t < 60_000) return cached.users;
+    try {
+      const rows = await this.env.DB.prepare(
+        'SELECT user_id FROM chat_members WHERE chat_id = ?',
+      ).bind(chatID).all<{ user_id: number }>();
+      const users = new Set((rows.results || []).map((r) => r.user_id));
+      this.memberCache.set(chatID, { users, t: now });
+      return users;
+    } catch {
+      return cached?.users || new Set<number>();
+    }
+  }
+
 
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
@@ -27,7 +47,7 @@ export class Hub {
 
     if (url.pathname === '/broadcast' && req.method === 'POST') {
       const frame = await req.json() as Frame;
-      this.broadcast(frame);
+      await this.broadcast(frame);
       return new Response('ok');
     }
 
@@ -112,10 +132,13 @@ export class Hub {
       return;
     }
 
-    // Обычное сообщение из чата: сохранить + разослать всем.
+    // Обычное сообщение из чата: сохранить + разослать всем. Только участник чата может писать.
     if (data?.chatId && data?.type !== 'typing' && data?.type !== 'edit' && data?.type !== 'delete') {
+      const chatID = Number(data.chatId) || 1;
+      const mem = await this.members(chatID);
+      if (!mem.has(s.userID)) return; // не свой чат — молча игнорируем
       const f = {
-        chatId: Number(data.chatId) || 1,
+        chatId: chatID,
         userId: s.userID,
         username: s.username,
         text: String(data.text ?? ''),
@@ -130,7 +153,7 @@ export class Hub {
         replyTo: Number(data.replyTo) || 0,
       } as Frame;
       const saved = await saveAndBroadcast(this.env, f);
-      this.broadcast(saved);
+      await this.broadcast(saved);
       return;
     }
 
@@ -142,6 +165,8 @@ export class Hub {
         'SELECT COALESCE(chat_id, 1) AS chat_id FROM messages WHERE id = ?',
       ).bind(mid).first<{ chat_id: number }>();
       if (!chat) return;
+      const memReact = await this.members(Number(chat.chat_id) || 1);
+      if (!memReact.has(s.userID)) return; // реакции только своим
       if (data.remove) {
         await this.env.DB.prepare(
           'DELETE FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?',
@@ -151,7 +176,7 @@ export class Hub {
           'INSERT OR REPLACE INTO reactions (message_id, user_id, username, emoji) VALUES (?, ?, ?, ?)',
         ).bind(mid, s.userID, s.username, emoji).run();
       }
-      this.broadcast({
+      await this.broadcast({
         type: 'reaction',
         messageId: mid,
         chatId: Number(chat.chat_id) || 1,
@@ -165,7 +190,9 @@ export class Hub {
 
     // «X печатает…» — только событие, в БД не пишем.
     if (data?.type === 'typing' && data?.chatId) {
-      this.broadcast({
+      const memTyping = await this.members(Number(data.chatId) || 1);
+      if (!memTyping.has(s.userID)) return;
+      await this.broadcast({
         type: 'typing',
         chatId: Number(data.chatId) || 1,
         userId: s.userID,
@@ -185,7 +212,7 @@ export class Hub {
       ).bind(newText, id, s.userID).run();
       if (!upd.meta.changes) return; // не своё/не найдено — молча
       const row = await this.env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(id).first<any>();
-      if (row) this.broadcast({ ...frameFromRow(row), type: 'edit' } as any);
+      if (row) await this.broadcast({ ...frameFromRow(row), type: 'edit' } as any);
       return;
     }
 
@@ -201,14 +228,22 @@ export class Hub {
       ).bind(id, s.userID).run();
       if (!upd.meta.changes) return;
       const row = await this.env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(id).first<any>();
-      if (row) this.broadcast({ ...frameFromRow(row), type: 'delete' } as any);
+      if (row) await this.broadcast({ ...frameFromRow(row), type: 'delete' } as any);
       return;
     }
   }
 
-  private broadcast(f: Frame) {
+  // Рассылка КАДРА только участникам его чата. Кадры без chatId рассылаются всем
+  // (системные: auth_ok и т.п. — они идут через sendTo, а не сюда).
+  private async broadcast(f: Frame & { chatId?: number }) {
     const raw = JSON.stringify(f);
+    let members: Set<number> | null = null;
+    if (f.chatId) {
+      members = await this.members(Number(f.chatId));
+      if (!members.size) return; // fail-closed: не знает членов чата — не светим
+    }
     for (const [id, s] of this.sockets) {
+      if (members && s.userID && !members.has(s.userID)) continue;
       try { s.ws.send(raw); } catch { this.sockets.delete(id); }
     }
   }

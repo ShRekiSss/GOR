@@ -6,6 +6,7 @@ export interface Env {
   LIMIT: DurableObjectNamespace;
   ASSETS: Fetcher;
   VERSION: string; // секрет/вар — необязательный, есть дефолт
+  GOR_GIPHY_KEY?: string; // ключ GIPHY (optional): без него /api/giphy отдаёт ошибку
 }
 
 export interface UserRow {

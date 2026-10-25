@@ -5,6 +5,20 @@ import {
   User, USERNAME_RE, createSession, hashPassword, rateLimitAuth, tokenFromRequest, userByToken, verifyPassword,
 } from './auth';
 import { text } from './index';
+
+// In-memory: кэш GIPHY-поиска на изолят + лимит поиска (троттлинг на юзера × минуту).
+const giphyCache = new Map<string, { items: { id: string; url: string; title: string }[]; t: number }>();
+const giphyHits = new Map<number, { n: number; t: number }>();
+async function limitOk(_env: Env, userID: number, _kind: string): Promise<boolean> {
+  // 30 поисков в минуту на юзера — больше стикера не нужно, спасти квоту.
+  const rec = giphyHits.get(userID);
+  if (!rec || Date.now() - rec.t > 60_000) {
+    giphyHits.set(userID, { n: 1, t: Date.now() });
+    return true;
+  }
+  rec.n += 1;
+  return rec.n <= 30;
+}
 import { hhmmss, saveAndBroadcast, broadcastOnly } from './hub';
 
 function json(obj: unknown, status = 200): Response {
@@ -146,6 +160,32 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
     }
     await env.DB.prepare('UPDATE users SET avatar = ? WHERE id = ?').bind(du, user.id).run();
     return json({ user: { ...user, avatar: du } });
+  }
+
+  // ---------- GIPHY-прокси (паритет с main.go): ключ живёт на сервере ----------
+  // Кэш на изолят 10 минут, чтобы не сжигать квоту GIPHY при спаме поиска.
+  if (path === '/api/giphy' && req.method === 'GET') {
+    if (!env.GOR_GIPHY_KEY) {
+      return json({ error: 'GIPHY отключён: задайте GOR_GIPHY_KEY на сервере' }, 503);
+    }
+    const q = (url.searchParams.get('q') || '').trim();
+    if (!q) return text('Укажите поисковый запрос ?q=', 400);
+    if (!(await limitOk(env, user.id, 'giphy'))) return text('Слишком много запросов, попробуйте позже', 429);
+    const gkey = `giphy:${q.toLowerCase().slice(0, 64)}`;
+    const cached = giphyCache.get(gkey);
+    if (cached && Date.now() - cached.t < 600_000) return json({ data: cached.items, cached: true });
+    const api = `https://api.giphy.com/v1/gifs/search?api_key=${encodeURIComponent(env.GOR_GIPHY_KEY)}&q=${encodeURIComponent(q)}&limit=12&rating=pg-13`;
+    const gr = await fetch(api, { cf: { cacheTtl: 300 } }).catch(() => null);
+    if (!gr || !gr.ok) return text('Не удалось выполнить поиск GIF', 502);
+    const gd = await gr.json().catch(() => null);
+    if (!gd?.data) return text('Не удалось выполнить поиск GIF', 502);
+    const items = (gd.data as any[]).slice(0, 12).map((g) => ({
+      id: g.id,
+      url: g.images?.original?.url || g.images?.downsized?.url || '',
+      title: g.title || '',
+    })).filter((g) => g.url);
+    giphyCache.set(gkey, { items, t: Date.now() });
+    return json({ data: items });
   }
 
   if (path === '/api/users' && req.method === 'GET') {
