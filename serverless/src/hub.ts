@@ -168,7 +168,7 @@ export class Hub {
       await this.broadcast(saved);
       // Пуш тем участникам, кого нет на WS (офлайн): таблица push_subscriptions.
       try {
-        if (f.type === 'text' || f.type === 'file' || f.type === 'sticker') {
+        if (f.type === 'text' || f.type === 'file' || f.type === 'sticker' || f.type === 'voice') {
           const mem = await this.members(chatID);
           const online = new Set<number>();
           for (const [, t] of this.sockets) if (t.userID) online.add(t.userID);

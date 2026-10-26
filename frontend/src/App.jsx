@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
 import {
   apiUrl,
@@ -155,6 +155,20 @@ function App() {
   const [searchable, setSearchable] = useState(null);
   // Кнопка «вниз» в ленте чата.
   const [showJump, setShowJump] = useState(false);
+  // ---------- v1.0.4: звонки с видео/шарингом ----------
+  const [callExpanded, setCallExpanded] = useState(false); // Discord-оверлей
+  const [callSwap, setCallSwap] = useState(false);         // свап тайлов
+  const [callQuality, setCallQuality] = useState(null);    // {rtt, label}
+  // ---------- v1.0.4: голосовые «кружочки» ----------
+  const [voiceRec, setVoiceRec] = useState(null); // { secs }
+  const voiceRef = useRef(null);                  // { rec, chunks, stream, t0, timer, mime }
+  // ---------- v1.0.4: истории (24 ч, ТГ/ТТ) ----------
+  const [storiesGroups, setStoriesGroups] = useState([]); // [{userId, username, avatar, allSeen, stories[]}]
+  const [storyViewer, setStoryViewer] = useState(null);   // { group, idx }
+  const [storyComposer, setStoryComposer] = useState(null); // { file, preview, caption, gradient, busy }
+  const [stProgress, setStProgress] = useState(0.0);      // прогресс текущей стори 0..1
+  const storyVideoRef = useRef(null);
+  const storySwipeRef = useRef(null);
 
   const setTheme = (next) => {
     setThemeState(next);
@@ -210,6 +224,8 @@ function App() {
   const [callSecs, setCallSecs] = useState(0);
   const callEngineRef = useRef(null);
   const remoteAudioRef = useRef(null);
+  const remoteVideoRef = useRef(null);
+  const localVideoRef = useRef(null);
   const isMobileRef = useRef(isMobile);
   const layersRef = useRef([]); // стек «слоёв» для системной кнопки «назад»
   const gestureRef = useRef(null);
@@ -1405,6 +1421,307 @@ function App() {
     ));
   };
 
+  // ---------- v1.0.4: голосовые «кружочки» (ТГ-стиль) ----------
+  const VOICE_MAX = 120; // сек
+
+  const toggleVoice = async () => {
+    // Работает только в чате; «тап старт → тап стоп».
+    if (voiceRef.current) {
+      try { voiceRef.current.rec.stop(); } catch { /* сами */ }
+      return;
+    }
+    if (!activeChatId || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      showToast('Сначала выбери чат');
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      showToast('Запись голоса не поддерживается');
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      });
+      const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4']
+        .find((m) => MediaRecorder.isTypeSupported?.(m)) || '';
+      const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+      const chunks = [];
+      rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+      rec.onstop = () => {
+        stream.getTracks().forEach((t) => t.stop());
+        clearInterval(rec._timer);
+        const secs = Math.max(1, Math.round((Date.now() - rec._t0) / 1000));
+        setVoiceRec(null);
+        voiceRef.current = null;
+        sendVoice(new Blob(chunks, { type: rec.mimeType || 'audio/webm' }), secs);
+      };
+      rec._t0 = Date.now();
+      rec._timer = setInterval(() => {
+        const s = Math.round((Date.now() - rec._t0) / 1000);
+        setVoiceRec((v) => ({ ...v, secs: s, tooLong: s >= VOICE_MAX }));
+        if (s >= VOICE_MAX) cancelVoice(); // 2 минуты — потолок
+      }, 250);
+      rec.start(250);
+      voiceRef.current = { rec, stream };
+      setVoiceRec({ secs: 0, tooLong: false });
+    } catch {
+      showToast('Нет доступа к микрофону');
+    }
+  };
+
+  const cancelVoice = () => {
+    const v = voiceRef.current;
+    if (!v) return;
+    v.rec.onstop = null; // не отправлять — отменяем
+    try { v.rec.stop(); } catch { /* уже */ }
+    clearInterval(v.rec._timer);
+    v.rec._t0 = 0;
+    try { v.stream?.getTracks().forEach((t) => t.stop()); } catch { /* уже */ }
+    voiceRef.current = null;
+    setVoiceRec(null);
+    showToast('Запись отменена');
+  };
+
+  const sendVoice = async (blob, secs) => {
+    if (!activeChatId) return;
+    const ext = /mp4/.test(blob.type) ? 'm4a' : 'webm';
+    const file = new File([blob], `voice-${Date.now()}.${ext}`, { type: blob.type || 'audio/webm' });
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('chatId', String(activeChatId));
+    fd.append('silent', '1'); // без авто-«📎 файл» — кружок сам расскажет о себе
+    try {
+      const r = await authFetch('/api/upload', { method: 'POST', body: fd });
+      if (!r.ok) throw new Error((await r.text()).trim() || 'загрузка не прошла');
+      const d = await r.json();
+      const frame = {
+        chatId: activeChatId,
+        username,
+        type: 'voice',
+        text: `🎙 Голосовое · ${secs} с`,
+        fileUrl: d.fileUrl,
+        fileName: d.fileName,
+        fileSize: d.fileSize,
+        fileType: 'audio',
+      };
+      if (replyTo?.id) frame.replyTo = replyTo.id;
+      wsRef.current.send(JSON.stringify(frame));
+      setReplyTo(null);
+    } catch (e) {
+      showToast(`Голосовое не ушло: ${e.message}`);
+    }
+  };
+
+  // Парсер «Голосовое · N с» → секунды (для кружка до загрузки волны).
+  const voiceSecs = (msg) => {
+    const m = String(msg.text || '').match(/(\d+)\s*с/);
+    return m ? Number(m[1]) : 0;
+  };
+
+  // ---------- v1.0.4: нейро-бот ----------
+  const sendAiMessage = async () => {
+    if (!inputValue.trim()) {
+      showToast('Напиши вопрос боту в поле ввода');
+      return;
+    }
+    if (!activeChatId) return;
+    const text = inputValue.trim();
+    setInputValue('');
+    try {
+      const r = await authFetch('/api/ai', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chatId: activeChatId, text }),
+      });
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({}));
+        throw new Error(e.error || (await r.text()).trim() || 'не отвечает');
+      }
+    } catch (e) {
+      showToast(`${e.message}`);
+    }
+  };
+
+  // ---------- v1.0.4: истории (24 ч, ТГ/ТТ-стиль) ----------
+  const loadStories = async () => {
+    try {
+      const r = await authFetch('/api/stories');
+      if (r.ok) setStoriesGroups((await r.json()).groups || []);
+    } catch { /* сеть дрогнула */ }
+  };
+
+  // Загружаем истории при входе; кольца обновляются каждые 3 минуты.
+  useEffect(() => {
+    if (!user) {
+      setStoriesGroups([]);
+      return undefined;
+    }
+    loadStories();
+    const t = setInterval(loadStories, 180_000);
+    return () => clearInterval(t);
+  }, [user]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // username → группа историй (для колец у аватарок в чат-листе).
+  const storiesMap = useMemo(() => {
+    const m = new Map();
+    storiesGroups.forEach((g) => m.set(String(g.username).toLowerCase(), g));
+    return m;
+  }, [storiesGroups]);
+
+  const openStoryComposer = () => {
+    setStoryComposer({ file: null, preview: '', caption: '', gradient: 0, busy: false });
+  };
+
+  const onStoryFile = (e) => {
+    const f = e.target.files?.[0];
+    e.target.value = '';
+    if (!f) return;
+    if (!/^(image\/(jpe?g|png|webp)|video\/(mp4|webm))/.test(f.type)) {
+      showToast('Фото (jpg/png/webp) или видео (mp4/webm)');
+      return;
+    }
+    if (f.size > 48 * 1024 * 1024) {
+      showToast('Видео до 50 МБ, фото сожмём сами');
+      return;
+    }
+    const url = URL.createObjectURL(f);
+    setStoryComposer((c) => ({ ...c, file: f, preview: url }));
+  };
+
+  const GRADIENTS = [
+    'linear-gradient(135deg,#ff9a9e,#fad0c4)', 'linear-gradient(135deg,#a18cd1,#fbc2eb)',
+    'linear-gradient(135deg,#84fab0,#8fd3f4)', 'linear-gradient(135deg,#fccb90,#d57eeb)',
+    'linear-gradient(135deg,#e0c3fc,#8ec5fc)', 'linear-gradient(135deg,#f6d365,#fda085)',
+    'linear-gradient(135deg,#5ee7df,#b490ca)', 'linear-gradient(135deg,#30cfd0,#330867)',
+  ];
+
+  const publishStory = async () => {
+    const c = storyComposer;
+    if (!c || c.busy) return;
+    if (!c.file && !c.caption.trim()) {
+      showToast('Выбери фото/видео или напиши текст');
+      return;
+    }
+    setStoryComposer({ ...c, busy: true });
+    const fd = new FormData();
+    if (c.file) fd.append('file', c.file);
+    fd.append('caption', c.caption.trim().slice(0, 500));
+    fd.append('gradient', String(c.gradient));
+    if (c.file?.type.startsWith('video/')) {
+      fd.append('durationMs', String(Math.round((storyVideoRef.current?.duration || 5) * 1000)));
+    }
+    try {
+      const r = await authFetch('/api/stories', { method: 'POST', body: fd });
+      if (!r.ok) throw new Error((await r.text()).trim() || 'не опубликовалось');
+      setStoryComposer(null);
+      showToast('История отправлена (живёт 24 ч)');
+      loadStories();
+    } catch (e) {
+      setStoryComposer((cur) => (cur ? { ...cur, busy: false } : cur));
+      showToast(`История не улетела: ${e.message}`);
+    }
+  };
+
+  // Просмотрщик: открытие группы, отметка просмотра.
+  const openStories = (group) => {
+    if (!group?.stories?.length) return;
+    setStProgress(0);
+    setStoryViewer({ userId: group.userId, idx: 0 });
+  };
+
+  const closeStory = () => setStoryViewer(null);
+
+  const group = storyViewer ? storiesGroups.find((g) => g.userId === storyViewer.userId) : null;
+  const story = group?.stories?.[storyViewer.idx];
+
+  useEffect(() => {
+    if (story && !story.seen) {
+      authFetch(`/api/stories/${story.id}/view`, { method: 'POST' }).then(() => {
+        story.seen = true; // локально — чтобы обновление не моргало кольцом
+      }).catch(() => {});
+    }
+  }, [story?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Авто-переход: фото/текст — 5 c по таймеру; видео — по своему onTimeUpdate.
+  useEffect(() => {
+    if (!storyViewer || !story) return undefined;
+    if (story.kind === 'video') return undefined; // видео двигает прогресс само
+    setStProgress(0);
+    const t0 = Date.now();
+    const t = setInterval(() => {
+      const p = Math.min(1, (Date.now() - t0) / 5000);
+      setStProgress(p);
+      if (p >= 1) setStoryViewer((v) => ({ userId: v.userId, idx: v.idx + 1 }));
+    }, 100);
+    return () => clearInterval(t);
+  }, [storyViewer?.idx, storyViewer?.userId, story?.kind]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Ничего не осталось (все просмотрены/удалены) — закрыть.
+  useEffect(() => {
+    if (storyViewer && !story) closeStory();
+  }, [storyViewer, story]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const navStory = (dir) => {
+    if (!group) return;
+    const next = storyViewer.idx + dir;
+    if (next >= group.stories.length) {
+      const gi = storiesGroups.findIndex((g) => g.userId === group.userId);
+      const ng = storiesGroups[gi + 1] || storiesGroups[0];
+      if (ng && (gi + 1 < storiesGroups.length)) {
+        setStoryViewer({ userId: ng.userId, idx: 0 });
+      } else {
+        closeStory();
+      }
+      return;
+    }
+    setStProgress(0);
+    setStoryViewer({ userId: group.userId, idx: Math.max(0, next) });
+  };
+
+  const replyStory = async () => {
+    if (!group) return;
+    closeStory();
+    if (group.userId === user?.id) {
+      showToast('Это твоя история 🙂');
+      return;
+    }
+    await createDirect(group.username);
+    // Черновик ответа кладём инпут после создания ЛС.
+    setTimeout(() => setInputValue('По сторис: '), 600);
+  };
+
+  const deleteStory = async () => {
+    if (!story || group?.userId !== user?.id) return;
+    try {
+      const r = await authFetch(`/api/stories/${story.id}`, { method: 'DELETE' });
+      if (r.status === 204) {
+        showToast('История удалена');
+        setStoriesGroups((prev) => {
+          const g = prev.find((x) => x.userId === user.id);
+          if (!g) return prev;
+          g.stories = g.stories.filter((s2) => s2.id !== story.id);
+          return [...prev];
+        });
+      }
+    } catch { /* уже */ }
+  };
+
+  // ---------- v1.0.4: Discord-оверлей звонка (видео, тайлы, качество) ----------
+  useEffect(() => {
+    // Качество связи — каждые 2 c, только во время активного звонка.
+    if (!call || call.status !== 'active') {
+      setCallQuality(null);
+      return undefined;
+    }
+    const pull = async () => {
+      const q = await callEngineRef.current?.getQuality();
+      setCallQuality(q || null);
+    };
+    pull();
+    const t = setInterval(pull, 2000);
+    return () => clearInterval(t);
+  }, [call?.status, call?.peer]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const createGroup = async () => {
     setChatError('');
     if (!groupTitle.trim()) {
@@ -1779,8 +2096,12 @@ function App() {
       },
       onEvent: (state, toastMsg) => {
         setCall(state);
+        if (state?.status !== 'active') setCallSwap(false);
+        if (!state) {
+          setCallSecs(0);
+          setCallExpanded(false); // звонок кончился — оверлей не висит
+        }
         if (toastMsg) showToastRef.current?.(toastMsg);
-        if (!state) setCallSecs(0);
       },
     });
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -1809,6 +2130,15 @@ function App() {
       }
     }
   }, [call?.stream, call?.status]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Оверлей: подключаем видео тайлы каждый раз, когда он развёрнут.
+  useEffect(() => {
+    if (!callExpanded) return;
+    const rv = remoteVideoRef.current;
+    const lv = localVideoRef.current;
+    if (rv) rv.srcObject = call?.stream || null;
+    if (lv) lv.srcObject = call?.localStream || null;
+  }, [callExpanded, call?.stream, call?.localStream, call?.peer]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const openCompose = () => {
     setComposeOpen(true);
@@ -2100,6 +2430,12 @@ function App() {
       );
     }
 
+    // Голосовое «кружочком» (ТГ-стиль) — раньше всех file-веток.
+    if (msg.type === 'voice' && msg.fileUrl) {
+      const resolved = { ...msg, fileUrl: resolveUrl(msg.fileUrl) };
+      return <VoiceBubble msg={resolved} mine={msg.userId === user?.id} />;
+    }
+
     if (msg.fileUrl) {
       return renderFileAttachment(msg);
     }
@@ -2346,6 +2682,33 @@ function App() {
           </button>
           <button
             type="button"
+            className={`call-btn cam ${!call.camOn ? 'off' : ''}`}
+            onClick={() => callEngineRef.current?.toggleCamera()}
+            disabled={call.status !== 'active'}
+            title={call.camOn ? 'Выключить камеру' : 'Включить камеру'}
+          >
+            📹
+          </button>
+          <button
+            type="button"
+            className={`call-btn screen ${call.sharing ? 'on' : ''}`}
+            onClick={() => callEngineRef.current?.toggleScreen()}
+            disabled={call.status !== 'active' || !call.screenOk}
+            title={call.screenOk ? (call.sharing ? 'Остановить демонстрацию' : 'Демонстрация экрана') : 'Демонстрация доступна только на ПК'}
+          >
+            🖥
+          </button>
+          <button
+            type="button"
+            className="call-btn expand"
+            onClick={() => setCallExpanded(true)}
+            disabled={call.status === 'outgoing' || call.status === 'connecting'}
+            title="Развернуть звонок (видео, тайлы, качество)"
+          >
+            ⛶
+          </button>
+          <button
+            type="button"
             className={`call-btn mute ${call.muted ? 'muted' : ''}`}
             onClick={() => callEngineRef.current?.toggleMute()}
             title={call.muted ? 'Включить микрофон' : 'Заглушить микрофон'}
@@ -2374,6 +2737,8 @@ function App() {
         <div className="sidebar-actions">
           <button type="button" className="new-chat-button" onClick={() => openModal('direct')}>＋ ЧАТ</button>
           <button type="button" className="new-group-button" onClick={() => openModal('group')}>＋ ГРУППА</button>
+          {/* Истории 24 ч (ТГ/ТТ-стиль): публикация из сайдбара. */}
+          <button type="button" className="stories-add" onClick={openStoryComposer}>＋ СТОРИ</button>
         </div>
 
         <div
@@ -2406,7 +2771,17 @@ function App() {
             >
               <div className="chat-item-top">
                 {chat.type === 'direct' && chat.avatar && (
-                  <img className="chat-item-avatar" src={chat.avatar} alt={chat.peer} />
+                  <span
+                    className={`story-ring ${storiesMap.get(String(chat.peer).toLowerCase())
+                      ? (storiesMap.get(String(chat.peer).toLowerCase()).allSeen ? 'seen' : 'unseen') : ''}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      const g = storiesMap.get(String(chat.peer).toLowerCase());
+                      if (g) openStories(g);
+                    }}
+                  >
+                    <img className="chat-item-avatar" src={chat.avatar} alt={chat.peer} />
+                  </span>
                 )}
                 <span className="chat-item-title">
                   {chat.type === 'group' ? '# ' : '@ '}{chat.title || chat.peer || 'Чат'}
@@ -2494,7 +2869,7 @@ function App() {
                 if (callEngineRef.current?.pc) {
                   showToast('Уже в звонке');
                 } else {
-                  callEngineRef.current?.start(activeChat.peer || activeChat.title);
+                  callEngineRef.current?.start(activeChat.peer || activeChat.title, { video: true });
                 }
               }}
               title="Голосовой звонок"
@@ -2912,6 +3287,39 @@ function App() {
             title="Спец с ошипкой (стикеры)"
           >
             🎨
+          </button>
+          {/* Голосовое ТГ-кружочком: тап старт → тап стоп/отправка. */}
+          {voiceRec ? (
+            <span
+              className="voice-live"
+              onClick={toggleVoice}
+              role="button"
+              title="Тап — отправить, ✕ — отменить"
+            >
+              <span className="voice-dot" />
+              {String(Math.floor(voiceRec.secs / 60)).padStart(2, '0')}:{String(voiceRec.secs % 60).padStart(2, '0')}
+              <button type="button" className="voice-cancel" onClick={(e) => { e.stopPropagation(); cancelVoice(); }}>✕</button>
+            </span>
+          ) : (
+            <button
+              type="button"
+              onClick={toggleVoice}
+              disabled={!isConnected || !activeChatId}
+              className="voice-button"
+              title="Голосовое сообщение (кружочек)"
+            >
+              🎤
+            </button>
+          )}
+          {/* Нейро-бот: отвечает в текущий чат (нужен ключ GOR_AI_KEY на сервере). */}
+          <button
+            type="button"
+            onClick={sendAiMessage}
+            disabled={!isConnected || !activeChatId}
+            className="ai-button"
+            title="Спросить VAKSA-бота (используя то, что в поле ввода)"
+          >
+            🤖
           </button>
           <input
             ref={fileInputRef}
@@ -3360,7 +3768,7 @@ function App() {
                           return;
                         }
                         setProfileOpen(false);
-                        callEngineRef.current?.start(profileData.username);
+                        callEngineRef.current?.start(profileData.username, { video: true });
                       }}
                     >
                       📞 Позвонить
@@ -3480,6 +3888,195 @@ function App() {
         </div>
       )}
 
+      {/* ---------- Истории: публикация ---------- */}
+      {storyComposer && (
+        <div className="story-composer-overlay" onClick={() => !storyComposer.busy && setStoryComposer(null)}>
+          <div className="story-composer-card" onClick={(e) => e.stopPropagation()}>
+            <h2>Новая история <span className="story-ttl">24 ч</span></h2>
+            <div
+              className="story-preview"
+              style={!storyComposer.file ? { background: GRADIENTS[storyComposer.gradient] } : undefined}
+            >
+              {storyComposer.file && /^image\//.test(storyComposer.file.type) && (
+                <img src={storyComposer.preview} alt="" />
+              )}
+              {storyComposer.file && /^video\//.test(storyComposer.file.type) && (
+                <video
+                  ref={storyVideoRef}
+                  src={storyComposer.preview}
+                  controls
+                  playsInline
+                />
+              )}
+              {!storyComposer.file && (
+                <span className="story-preview-text">{storyComposer.caption || 'Текстовая история'}</span>
+              )}
+            </div>
+            {storyComposer.file ? (
+              <button
+                type="button"
+                className="avatar-change"
+                onClick={() => setStoryComposer({ ...storyComposer, file: null, preview: '' })}
+              >
+                Убрать медиа (останется текст)
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="avatar-change"
+                onClick={() => document.getElementById('story-file-inp')?.click()}
+              >
+                Фото или видео…
+              </button>
+            )}
+            <input
+              id="story-file-inp"
+              type="file"
+              accept="image/jpeg,image/png,image/webp,video/mp4,video/webm"
+              onChange={onStoryFile}
+              style={{ display: 'none' }}
+            />
+            <textarea
+              className="setup-input"
+              rows={2}
+              placeholder="Подпись (до 500 символов)…"
+              maxLength={500}
+              value={storyComposer.caption}
+              onChange={(e) => setStoryComposer({ ...storyComposer, caption: e.target.value })}
+            />
+            {!storyComposer.file && (
+              <div className="gradient-row">
+                {GRADIENTS.map((g, i) => (
+                  <button
+                    key={i}
+                    type="button"
+                    className={`grad-chip ${storyComposer.gradient === i ? 'active' : ''}`}
+                    style={{ background: g }}
+                    onClick={() => setStoryComposer({ ...storyComposer, gradient: i })}
+                    title={`Фон ${i + 1}`}
+                  />
+                ))}
+              </div>
+            )}
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="settings-cancel"
+                onClick={() => setStoryComposer(null)}
+                disabled={storyComposer.busy}
+              >
+                ОТМЕНА
+              </button>
+              <button
+                type="button"
+                className="settings-save"
+                onClick={publishStory}
+                disabled={storyComposer.busy}
+              >
+                {storyComposer.busy ? 'ОТПРАВЛЯЮ…' : 'В СТОРИ'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ---------- Истории: просмотрщик (ТГ-стиль) ---------- */}
+      {storyViewer && group && story && (
+        <div
+          className="story-viewer"
+          onClick={(e) => {
+            const x = e.clientX / Math.max(1, e.currentTarget.clientWidth);
+            navStory(x < 0.35 ? -1 : 1);
+          }}
+          onTouchStart={(e) => {
+            const t = e.touches[0];
+            storySwipeRef.current = { y0: t.clientY, t0: Date.now() };
+          }}
+          onTouchEnd={(e) => {
+            const s = storySwipeRef.current;
+            if (!s) return;
+            storySwipeRef.current = null;
+            const t = e.changedTouches[0];
+            if (t.clientY - s.y0 > 90 && Date.now() - s.t0 < 500) closeStory(); // свайп вниз
+          }}
+        >
+          <div className="story-track">
+            {group.stories.map((s2, i) => (
+              <span
+                key={s2.id}
+                className={`story-seg ${i === storyViewer.idx ? 'cur' : ''} ${i < storyViewer.idx ? 'done' : ''}`}
+              >
+                {i === storyViewer.idx && story.kind !== 'video' && (
+                  <i style={{ width: `${Math.round(stProgress * 100)}%` }} />
+                )}
+                {i === storyViewer.idx && story.kind === 'video' && (
+                  <i style={{ width: `${Math.round(stProgress * 100)}%` }} />
+                )}
+              </span>
+            ))}
+          </div>
+          <div className="story-header">
+            <img
+              className="story-avatar"
+              src={group.avatar || ''}
+              alt=""
+              onError={(e) => { e.currentTarget.style.visibility = 'hidden'; }}
+            />
+            <div className="story-who">
+              <b>{group.userId === user?.id ? 'Твоя история' : group.username}</b>
+              <span>{fmtStoryAge(story.createdAt)}</span>
+            </div>
+            <span className="story-viewcount">{story.views}👁</span>
+            {group.userId === user?.id && (
+              <button type="button" className="story-del" onClick={deleteStory} title="Удалить историю">🗑</button>
+            )}
+            <button type="button" className="story-close" onClick={closeStory} title="Закрыть">✕</button>
+          </div>
+
+          <div className="story-body">
+            {story.kind === 'video' ? (
+              <video
+                ref={storyVideoRef}
+                className="story-media"
+                src={resolveUrl(story.fileKey ? `/uploads/${story.fileKey}` : '')}
+                autoPlay
+                playsInline
+                onTimeUpdate={(e) => {
+                  const el = e.currentTarget;
+                  if (el.duration) setStProgress(el.currentTime / el.duration);
+                }}
+                onEnded={() => {
+                  setStProgress(1);
+                  navStory(1);
+                }}
+              />
+            ) : story.kind === 'image' ? (
+              <img
+                className="story-media"
+                src={resolveUrl(story.fileKey ? `/uploads/${story.fileKey}` : '')}
+                alt={story.caption || 'история'}
+              />
+            ) : (
+              <div className="story-text-frame" style={{ background: GRADIENTS[story.gradient || 0] }}>
+                <span>{story.caption}</span>
+              </div>
+            )}
+          </div>
+
+          {story.caption && story.kind !== 'text' && (
+            <div className="story-caption">{story.caption}</div>
+          )}
+
+          <div className="story-footer">
+            {group.userId !== user?.id && (
+              <button type="button" className="story-reply" onClick={replyStory}>
+                💬 Ответить
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {composeOpen && (
         <div className="sheet-overlay" onClick={closeCompose}>
           <div className="bottom-sheet" onClick={(e) => e.stopPropagation()}>
@@ -3524,7 +4121,7 @@ function App() {
           <div className="call-card">
             <div className="call-ring-anim"><span>@</span></div>
             <strong className="call-name">@{call.peer}</strong>
-            <span className="call-sub">входящий голосовой звонок…</span>
+            <span className="call-sub">входящий звонок…</span>
             <div className="call-actions">
               <button
                 type="button"
@@ -3538,11 +4135,110 @@ function App() {
                 type="button"
                 className="call-btn accept"
                 onClick={() => callEngineRef.current?.accept()}
-                title="Принять"
+                title="Принять (с камерой, как заявлено)"
               >
                 ✔
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Активный звонок — Discord-оверлей: большой тайл собеседника (или его
+          экрана), PiP свой, ряд управления с камерой/шарингом/громкостью. */}
+      {callExpanded && call && (
+        <div className="call-stage" onClick={(e) => e.stopPropagation()}>
+          <div className="call-stage-top">
+            <div className="call-stage-title">
+              <strong>@{call.peer}</strong>
+              <span className={`call-stage-quality q-${String(callQuality?.label || '')}`}>
+                {callQuality ? `связь: ${callQuality.label}` : call.status === 'active' ? 'связь: …' : call.status === 'outgoing' ? 'звоним…' : 'соединение…'}
+              </span>
+            </div>
+            <span className="call-stage-time">
+              {String(Math.floor(callSecs / 60)).padStart(2, '0')}:{String(callSecs % 60).padStart(2, '0')}
+            </span>
+            <button type="button" className="call-btn" onClick={() => setCallExpanded(false)} title="Свернуть в полосу">
+              ⤫
+            </button>
+          </div>
+
+          <div className="call-stage-tiles" onClick={() => setCallSwap((s) => !s)}>
+            {/* Большой тайл: демка собеседника/камера > PiP свой; тап — свап. */}
+            {(() => {
+              const remoteHasVideo = (call.stream?.getVideoTracks?.().length || 0) > 0;
+              const big = !callSwap && remoteHasVideo ? 'remote' : 'local';
+              const small = big === 'remote' ? 'local' : (callSwap && remoteHasVideo ? 'remote' : null);
+              return (
+                <>
+                  {big === 'remote' && (
+                    <video ref={remoteVideoRef} className="call-tile big" autoPlay playsInline />
+                  )}
+                  {big === 'local' && call.camOn && (
+                    <video ref={localVideoRef} className="call-tile big" autoPlay playsInline muted />
+                  )}
+                  {big === 'local' && !call.camOn && (
+                    <div className="call-tile big audio-tile">
+                      <span className="call-tile-letter">@{(call.peer || '?')[0].toUpperCase()}</span>
+                      <span>аудио-звонок{call.sharing ? ' · ты показываешь экран' : ''}</span>
+                    </div>
+                  )}
+                  {small === 'remote' && (
+                    <video ref={remoteVideoRef} className="call-tile pip" autoPlay playsInline />
+                  )}
+                  {small === 'local' && call.camOn && (
+                    <video ref={localVideoRef} className="call-tile pip" autoPlay playsInline muted />
+                  )}
+                  {call.sharing && (
+                    <div className="call-stage-share-badge">🖥 демонстрация экрана активна</div>
+                  )}
+                </>
+              );
+            })()}
+          </div>
+
+          <div className="call-stage-controls">
+            <button
+              type="button"
+              className={`call-btn big ${call.muted ? 'muted' : ''}`}
+              onClick={() => callEngineRef.current?.toggleMute()}
+              title={call.muted ? 'Включить микрофон' : 'Заглушить'}
+            >
+              {call.muted ? '🔇' : '🎙'}
+            </button>
+            <button
+              type="button"
+              className={`call-btn big ${!call.camOn ? 'off' : ''}`}
+              onClick={() => callEngineRef.current?.toggleCamera()}
+              title={call.camOn ? 'Выключить камеру' : 'Включить камеру'}
+            >
+              📹
+            </button>
+            <button
+              type="button"
+              className={`call-btn big ${call.sharing ? 'on' : ''}`}
+              onClick={() => callEngineRef.current?.toggleScreen()}
+              disabled={!call.screenOk}
+              title={call.screenOk ? 'Демонстрация экрана' : 'Демонстрация доступна только на ПК'}
+            >
+              🖥
+            </button>
+            <button
+              type="button"
+              className={`call-btn big ${call.boost ? 'on' : ''}`}
+              onClick={() => callEngineRef.current?.toggleBoost()}
+              title="Громкость на динамик ×2"
+            >
+              {call.boost ? '🔊' : '🔈'}
+            </button>
+            <button
+              type="button"
+              className="call-btn big reject"
+              onClick={() => { setCallExpanded(false); callEngineRef.current?.hangup(); }}
+              title="Завершить звонок"
+            >
+              ✕
+            </button>
           </div>
         </div>
       )}
@@ -3579,4 +4275,154 @@ function Markdown({ text }) {
   }
   if (last < src.length) parts.push(src.slice(last));
   return <>{parts}</>;
+}
+
+// Голосовое ТГ-кружочком: круглый плеер с волной из 24 баров. Волну считаем
+// на клиенте (decodeAudioData), прогресс — по timeupdate. Кэш высот по fileUrl.
+const VOICE_WAVES = new Map();
+
+// «2 ч назад» — подпись времени у стори.
+function fmtStoryAge(iso) {
+  const d = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(d) || d < 0) return 'только что';
+  const m = Math.floor(d / 60_000);
+  if (m < 1) return 'только что';
+  if (m < 60) return `${m} мин назад`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} ч назад`;
+  return `${Math.floor(h / 24)} дн назад`;
+}
+class VoiceBubble extends React.Component {
+  constructor(props) {
+    super(props);
+    const url = String(props.msg.fileUrl || '');
+    this.audio = null;
+    this.state = {
+      playing: false,
+      pos: 0,
+      dur: VOICE_WAVES.get(url)?.dur || 0,
+      bars: VOICE_WAVES.get(url)?.bars || null,
+      loading: !!VOICE_WAVES.get(url),
+    };
+  }
+
+  componentWillUnmount() {
+    if (this.audio) {
+      this.audio.pause();
+      this.audio.src = '';
+    }
+  }
+
+  async loadWave() {
+    const url = String(this.props.msg.fileUrl);
+    if (VOICE_WAVES.has(url)) {
+      const cached = VOICE_WAVES.get(url);
+      this.setState({ bars: cached.bars, dur: cached.dur, loading: false });
+      return;
+    }
+    try {
+      // fetch с токеном: /uploads требует Bearer-авторизацию.
+      const token = getToken();
+      const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
+      const ab = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', url);
+        if (headers) {
+          Object.entries(headers).forEach(([k, v]) => xhr.setRequestHeader(k, v));
+        }
+        xhr.responseType = 'arraybuffer';
+        xhr.onload = () => (xhr.status === 200 ? resolve(xhr.response) : reject(new Error(xhr.status)));
+        xhr.onerror = reject;
+        xhr.send();
+      });
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const buf = await ctx.decodeAudioData(ab);
+      const raw = buf.getChannelData(0);
+      const N = 24;
+      const step = Math.max(1, Math.floor(raw.length / N));
+      const bars = [];
+      for (let i = 0; i < N; i++) {
+        let peak = 0;
+        for (let j = i * step; j < Math.min(raw.length, (i + 1) * step); j += 8) {
+          const v = Math.abs(raw[j]);
+          if (v > peak) peak = v;
+        }
+        bars.push(Math.max(0.12, Math.min(1, peak * 4)));
+      }
+      ctx.close().catch(() => {});
+      const dur = buf.duration;
+      VOICE_WAVES.set(url, { bars, dur });
+      this.setState({ bars, dur, loading: false });
+    } catch {
+      this.setState({ loading: false, bars: null, dur: 0 }); // без волны — просто кружочек
+    }
+  }
+
+  async toggle() {
+    if (this.audio && this.state.playing) {
+      this.audio.pause();
+      this.setState({ playing: false });
+      return;
+    }
+    if (!this.audio) {
+      // <audio>/XHR без заголовков: /uploads принимает ?t=<token>.
+      const token = getToken();
+      const sep = String(this.props.msg.fileUrl).includes('?') ? '&' : '?';
+      const playUrl = token ? `${this.props.msg.fileUrl}${sep}t=${encodeURIComponent(token)}` : this.props.msg.fileUrl;
+      this.audio = new Audio(playUrl);
+      this.audio.addEventListener('timeupdate', () => {
+        const d = this.audio.duration || this.state.dur || 1;
+        const p = this.audio.currentTime / d;
+        // Прогресс по барам: сколько закрашено.
+        const bars = this.state.bars;
+        if (bars && bars.length) {
+          const pos = p * bars.length;
+          this.setState({ pos });
+        } else {
+          this.setState({ pos: p });
+        }
+      });
+      this.audio.addEventListener('ended', () => this.setState({ playing: false, pos: 0 }));
+    }
+    try {
+      await this.audio.play();
+      this.setState({ playing: true });
+      this.loadWaveOnce();
+    } catch {
+      this.loadWaveOnce();
+    }
+  }
+
+  loadWaveOnce() {
+    if (this._tried) return;
+    this._tried = true;
+    this.loadWave();
+  }
+
+  render() {
+    const { msg, mine } = this.props;
+    const { bars, dur, pos, playing, loading } = this.state;
+    const secs = Math.round(dur || Number(String(msg.text || '').match(/(\d+)\s*с/)?.[1] || 0));
+    const filled = bars ? Math.floor(pos) : pos;
+    return (
+      <div
+        className={`voice-circle ${mine ? 'mine' : ''} ${playing ? 'playing' : ''}`}
+        onClick={() => this.toggle()}
+        role="button"
+        title={playing ? 'Пауза' : 'Играть'}
+      >
+        <span className="vc-btn">{playing ? '⏸' : '▶'}</span>
+        {bars ? (
+          <span className="vc-wave" aria-hidden="true">
+            {bars.map((h, i) => (
+              <i key={i} style={{ height: `${Math.round(4 + h * 16)}px` }} className={i < filled ? 'on' : ''} />
+            ))}
+          </span>
+        ) : (
+          <span className={`vc-skeleton ${loading ? 'spin' : ''}`} />
+        )}
+        {!!secs && <span className="vc-dur">{secs > 59 ? `1:${String(secs % 60).padStart(2, '0')}` : `${secs}с`}</span>}
+      </div>
+    );
+  }
 }

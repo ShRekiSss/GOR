@@ -7,18 +7,19 @@ import {
 import { text } from './index';
 import { sendPush, pushPublicKey } from './push';
 
-// In-memory: кэш GIPHY-поиска на изолят + лимит поиска (троттлинг на юзера × минуту).
+// In-memory: кэш GIPHY-поиска на изолят + лимит на (юзер × kind × минуту).
 const giphyCache = new Map<string, { items: { id: string; url: string; title: string }[]; t: number }>();
-const giphyHits = new Map<number, { n: number; t: number }>();
-async function limitOk(_env: Env, userID: number, _kind: string): Promise<boolean> {
-  // 30 поисков в минуту на юзера — больше стикера не нужно, спасти квоту.
-  const rec = giphyHits.get(userID);
+const kindHits = new Map<string, { n: number; t: number }>();
+const KIND_LIMIT: Record<string, number> = { giphy: 30, ai: 20 };
+async function limitOk(_env: Env, userID: number, kind: string): Promise<boolean> {
+  const kkey = `${kind}:${userID}`;
+  const rec = kindHits.get(kkey);
   if (!rec || Date.now() - rec.t > 60_000) {
-    giphyHits.set(userID, { n: 1, t: Date.now() });
+    kindHits.set(kkey, { n: 1, t: Date.now() });
     return true;
   }
   rec.n += 1;
-  return rec.n <= 30;
+  return rec.n <= (KIND_LIMIT[kind] || 30);
 }
 import { hhmmss, saveAndBroadcast, broadcastOnly } from './hub';
 
@@ -405,6 +406,153 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
     return json(await getMessages(env, chatID, 100, 0, 0, user.id));
   }
 
+  // ---------- Нейро-бот (OpenAI-совместимый; без ключа — честная ошибка) ----------
+  if (path === '/api/ai' && req.method === 'POST') {
+    if (!env.GOR_AI_KEY) {
+      return json({ error: 'AI отключён: задайте секрет GOR_AI_KEY (wrangler secret put GOR_AI_KEY)' }, 503);
+    }
+    let body: { chatId?: number; text?: string };
+    try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
+    const chatID = Number(body.chatId) || 0;
+    const prompt = String(body.text ?? '').trim();
+    if (!prompt) return text('Пустой вопрос', 400);
+    if (prompt.length > 2000) return text('Вопрос слишком длинный (до 2000 символов)', 400);
+    if (!(await isMember(env, chatID, user.id))) return text('Нет доступа к чату', 403);
+    if (!(await limitOk(env, user.id, 'ai'))) return text('Слишком много запросов к боту, попробуйте позже', 429);
+
+    // Бот — обычный юзер в users, создаётся при первом обращении.
+    const botRow = await env.DB.prepare(
+      `INSERT INTO users (username, password_hash) VALUES ('VAKSA-бот', ?)
+       ON CONFLICT(username) DO NOTHING`,
+    ).bind(await hashPassword(`bot-${Date.now()}`)).run();
+    const bot = await env.DB.prepare(
+      "SELECT id, username, avatar FROM users WHERE username = 'VAKSA-бот' LIMIT 1",
+    ).first<{ id: number; username: string; avatar: string }>();
+    if (!bot) return text('Не удалось создать бота', 500);
+
+    // Вопрос юзера — как обычное сообщение (видно в истории чата).
+    const asked = await saveAndBroadcast(env, {
+      chatId: chatID, userId: user.id, username: user.username,
+      text: prompt, type: 'text', timestamp: hhmmss(),
+    } as Frame);
+    await broadcastOnly(env, asked);
+
+    const base = (env.GOR_AI_BASEURL || 'https://api.openai.com/v1').replace(/\/+$/, '');
+    const model = env.GOR_AI_MODEL || 'gpt-4o-mini';
+    const ar = await fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${env.GOR_AI_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        max_tokens: 600,
+        messages: [
+          { role: 'system', content: 'Ты VAKSA-бот в мессенджере VAKSA. Отвечай по-русски, кратко и по делу, дружелюбно. Markdown-таблицы и ссылки на файлы не используй — только обычный текст.' },
+          { role: 'user', content: prompt },
+        ],
+      }),
+    }).catch(() => null);
+    if (!ar || !ar.ok) {
+      return text(ar ? `AI-провайдер ответил ${ar.status}` : 'AI-провайдер недоступен', 502);
+    }
+    const ad = await ar.json().catch(() => null);
+    const reply = String(ad?.choices?.[0]?.message?.content || '').trim();
+    if (!reply) return text('AI вернул пустой ответ', 502);
+
+    const answer = await saveAndBroadcast(env, {
+      chatId: chatID, userId: bot.id, username: bot.username,
+      text: reply.slice(0, 4000), type: 'text', timestamp: hhmmss(),
+    } as Frame);
+    await broadcastOnly(env, answer);
+    return json({ message: answer });
+  }
+
+  // ---------- Истории (24 ч, ТГ/ТТ-стиль) ----------
+  if (path === '/api/stories' && req.method === 'GET') {
+    await cleanupStories(env);
+    const rows = await env.DB.prepare(
+      `SELECT s.id, s.user_id AS userId, s.kind, s.caption, s.file_key AS fileKey,
+              s.duration_ms AS durationMs, s.gradient, s.created_at AS createdAt,
+              s.expires_at AS expiresAt, u.username, u.avatar,
+              (SELECT COUNT(*) FROM story_views v WHERE v.story_id = s.id) AS views,
+              EXISTS(SELECT 1 FROM story_views v2 WHERE v2.story_id = s.id AND v2.user_id = ?) AS seen
+       FROM stories s JOIN users u ON u.id = s.user_id
+       WHERE s.expires_at > ?
+       ORDER BY s.created_at ASC`,
+    ).bind(user.id, new Date().toISOString()).all<any>();
+    // Группируем по автору: свои сверху, затем по свежести последней истории.
+    const byUser = new Map<number, any>();
+    for (const r of rows.results || []) {
+      r.seen = !!Number(r.seen); r.views = Number(r.views) || 0;
+      let g = byUser.get(r.userId);
+      if (!g) {
+        g = { userId: r.userId, username: r.username, avatar: r.avatar || '', allSeen: true, stories: [] };
+        byUser.set(r.userId, g);
+      }
+      if (!r.seen) g.allSeen = false;
+      delete r.userId; delete r.username; delete r.avatar;
+      g.stories.push(r);
+    }
+    const groups = [...byUser.values()].sort((a, b) => {
+      if (a.userId === user.id) return -1;
+      if (b.userId === user.id) return 1;
+      if (a.allSeen !== b.allSeen) return a.allSeen ? 1 : -1;
+      return 0;
+    });
+    return json({ groups, total: (rows.results || []).length });
+  }
+
+  if (path === '/api/stories' && req.method === 'POST') {
+    const form = await req.formData().catch(() => null);
+    if (!form) return text('Некорректный запрос', 400);
+    const caption = String(form.get('caption') || '').trim().slice(0, 500);
+    const gradient = Math.max(0, Math.min(7, Number(form.get('gradient')) || 0));
+    const file = form.get('file');
+    let kind = 'text', key = '', durMs = 0;
+    if (file instanceof File && file.size > 0) {
+      if (file.size > 50 * 1024 * 1024) return text('File too large (max 50MB)', 400);
+      const isImg = /^image\/(jpe?g|png|webp)(;|$)/.test(file.type || '');
+      const isVid = /^video\/(mp4|webm)(;|$)/.test(file.type || '');
+      if (!isImg && !isVid) return text('Только image/photo или видео mp4/webm', 400);
+      kind = isImg ? 'image' : 'video';
+      durMs = Math.max(0, Math.min(60_000, Number(form.get('durationMs')) || 0));
+      const originalName = safeUploadName(file.name || (isImg ? 'story.jpg' : 'story.mp4'));
+      key = `story_${Date.now()}${Math.floor(Math.random() * 1000)}_${originalName}`;
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      await putFileChunks(env, key, bytes, file.type || 'application/octet-stream');
+    } else if (!caption) {
+      return text('Пустая история: нужен файл или текст', 400);
+    }
+    const now = new Date();
+    const res = await env.DB.prepare(
+      `INSERT INTO stories (user_id, kind, caption, file_key, duration_ms, gradient, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(user.id, kind, caption, key, durMs, gradient, now.toISOString(),
+      new Date(now.getTime() + 24 * 3600 * 1000).toISOString()).run();
+    return json({ ok: true, id: res.meta.last_row_id }, 201);
+  }
+
+  if (seg[0] === 'api' && seg[1] === 'stories' && seg.length === 3) {
+    const sid = Number(seg[2]);
+    if (!Number.isInteger(sid) || sid <= 0) return text('Не найдено', 404);
+    if (req.method === 'POST') {
+      // Отметка просмотра: кто бы ни был — инкремент один раз.
+      await env.DB.prepare('INSERT OR IGNORE INTO story_views (story_id, user_id) VALUES (?, ?)')
+        .bind(sid, user.id).run();
+      return new Response(null, { status: 204 });
+    }
+    if (req.method === 'DELETE') {
+      const own = await env.DB.prepare(
+        'SELECT id, file_key AS fileKey FROM stories WHERE id = ? AND user_id = ?',
+      ).bind(sid, user.id).first<any>();
+      if (!own) return text('История не найдена', 404);
+      await env.DB.prepare('DELETE FROM stories WHERE id = ?').bind(sid).run();
+      await env.DB.prepare('DELETE FROM story_views WHERE story_id = ?').bind(sid).run();
+      if (own.fileKey) await deleteFileChunks(env, own.fileKey);
+      return new Response(null, { status: 204 });
+    }
+    return text('Method not allowed', 405);
+  }
+
   // ---------- upload ----------
   if (path === '/api/upload' && req.method === 'POST') {
     return handleUpload(req, env, user);
@@ -679,12 +827,25 @@ async function handleUpload(req: Request, env: Env, user: User): Promise<Respons
 
   const chatID = Number(form.get('chatId')) || 1;
   if (!(await isMember(env, chatID, user.id))) return text('Нет доступа к чату', 403);
+  // silent=1: только загрузка, без авто-«📎 отправил файл» — клиент сам решает,
+  // каким сообщением файл поедет (голосовое ТГ-кружочком, например).
+  const silent = String(form.get('silent') || '') === '1';
 
   const originalName = safeUploadName(file.name);
   const key = `${Date.now()}${Math.floor(Math.random() * 1000)}_${originalName}`;
 
   const bytes = new Uint8Array(await file.arrayBuffer());
   await putFileChunks(env, key, bytes, file.type || 'application/octet-stream');
+
+  if (silent) {
+    return json({
+      success: true,
+      fileUrl: `/uploads/${key}`,
+      fileName: originalName,
+      fileSize: file.size,
+      fileType: fileTypeOf(originalName),
+    });
+  }
 
   const msg: any = {
     chatId: chatID,
@@ -727,6 +888,31 @@ export async function putFileChunks(env: Env, key: string, bytes: Uint8Array, co
   } else {
     for (const s of stmts) await s.run();
   }
+}
+
+export async function deleteFileChunks(env: Env, key: string) {
+  if (!key) return;
+  const dels: D1PreparedStatement[] = [
+    env.DB.prepare('DELETE FROM files WHERE name = ?').bind(key),
+    env.DB.prepare('DELETE FROM file_chunks WHERE name = ?').bind(key),
+  ];
+  await env.DB.batch(dels).catch(() => { /* уже нет — не беда */ });
+}
+
+// Ленивая чистка историй: всё, что старше 24 ч, вместе с чанками (файлы
+// историй живут с префиксом story_ — файлы чатов не трогаем).
+export async function cleanupStories(env: Env) {
+  const now = new Date().toISOString();
+  const expired = await env.DB.prepare(
+    "SELECT id, file_key AS fileKey FROM stories WHERE expires_at <= ? AND (file_key LIKE 'story_%' OR file_key = '')",
+  ).bind(now).all<any>();
+  for (const s of expired.results || []) {
+    if (s.fileKey) await deleteFileChunks(env, s.fileKey);
+  }
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM stories WHERE expires_at <= ?').bind(now),
+    env.DB.prepare('DELETE FROM story_views WHERE story_id NOT IN (SELECT id FROM stories)'),
+  ]).catch(() => { /* гонка чисток — не беда */ });
 }
 
 export async function getFileChunks(env: Env, key: string): Promise<{ bytes: Uint8Array; contentType: string } | null> {

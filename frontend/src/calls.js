@@ -9,6 +9,7 @@ const RTC_CONFIG = {
 };
 
 const MEDIA_OK = typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getUserMedia;
+const MEDIA_SCREEN = typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getDisplayMedia;
 
 const RING_TIMEOUT = 45000; // кто-то не берёт трубку — сброс
 
@@ -103,6 +104,11 @@ export class CallEngine {
     this.boost = false;
     this._boostOn = false;
     this.audioGraph = null; // { ctx, src, gain } — создаётся при первом потоке
+    // Видео: своя камера (track), шаринг экрана, флаги для UI.
+    this.camOn = true;
+    this.sharing = false;
+    this.screenStream = null;
+    this._renegotiating = false;
   }
 
   emit(state, toast) {
@@ -116,11 +122,30 @@ export class CallEngine {
           direction: this.direction,
           status: this.status,
           stream: this.remote,
+          localStream: this.local,
           muted: this.muted,
           boost: this.boost,
           audioRouted: !!this.audioGraph,
+          camOn: this._videoEnabled(),
+          hasCam: !!this._camTrack(),
+          sharing: this.sharing,
+          screenOk: !!MEDIA_SCREEN,
         }
       : null;
+  }
+
+  _camTrack() {
+    return this.local?.getVideoTracks()[0] || null;
+  }
+
+  _videoEnabled() {
+    const t = this._camTrack();
+    return !!(t && t.enabled);
+  }
+
+  // --- Демо-экрана поддержка браузерами (ПК: браузер/Tauri WebView2; Android-WebView нет).
+  get SCREEN_OK() {
+    return MEDIA_SCREEN && this.status === 'active';
   }
 
   // --- Аудиомаршрут: до 1× играет сам <audio>-элемент; при бусте включаем
@@ -167,8 +192,26 @@ export class CallEngine {
     return this._boostOn;
   }
 
+  // --- Медиа: микрофон всегда; камера — если попросили и далась (иначе
+  // тихо падаем на аудио-звонок, как в роадмапе 4.6.4).
+  async _getUserMedia(wantVideo) {
+    const audio = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+    if (!wantVideo) {
+      return navigator.mediaDevices.getUserMedia({ audio });
+    }
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        audio,
+        video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { max: 30 } },
+      });
+    } catch (e) {
+      console.warn('cam:', e);
+      return navigator.mediaDevices.getUserMedia({ audio });
+    }
+  }
+
   // --- Исходящий звонок: getUserMedia + offer сразу (Discord-семантика быстрая) ---
-  async start(peer) {
+  async start(peer, opts = {}) {
     if (!peer) return;
     // Входящий в ringing не создаёт pc — поэтому одного this.pc мало:
     // иначе исходящий вызов молча затирает входящий.
@@ -186,9 +229,7 @@ export class CallEngine {
       return;
     }
     try {
-      this.local = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
+      this.local = await this._getUserMedia(!!opts.video);
     } catch (e) {
       console.warn('mic:', e);
       this.emit(null, 'Нет доступа к микрофону');
@@ -233,9 +274,7 @@ export class CallEngine {
     this.status = 'connecting';
     this.emit(this.currentState());
     try {
-      this.local = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
+      this.local = await this._getUserMedia(true);
       this.pc = new RTCPeerConnection(RTC_CONFIG);
       this.local.getTracks().forEach((t) => this.pc.addTrack(t, this.local));
       this.wirePC();
@@ -284,6 +323,131 @@ export class CallEngine {
     return this.muted;
   }
 
+  // --- Камера: если трек есть — enabled; если звали без камеры — добавляем
+  // трек на живой звонок (ренеготиация call_renegotiate_offer/answer).
+  async toggleCamera() {
+    if (!this.pc || this.status !== 'active') return false;
+    const track = this._camTrack();
+    if (track) {
+      track.enabled = !track.enabled;
+      this.emit(this.currentState());
+      return !track.enabled ? false : true;
+    }
+    try {
+      const cam = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+      });
+      this.local.addTrack(cam.getVideoTracks()[0]);
+      this.pc.addTrack(cam.getVideoTracks()[0], this.local);
+      await this._renegotiate();
+      this.emit(this.currentState(), 'Камера включена');
+      return true;
+    } catch (e) {
+      console.warn('cam add:', e);
+      this.emit(this.currentState(), 'Нет доступа к камере');
+      return false;
+    }
+  }
+
+  // --- Демонстрация экрана (как в Discord): replaceTrack без re-neg, если
+  // есть видео-sender; иначе добавляем через ренеготиацию.
+  async toggleScreen() {
+    if (this.sharing) {
+      this._stopScreen();
+      this.emit(this.currentState(), 'Демонстрация остановлена');
+      return false;
+    }
+    if (!MEDIA_SCREEN) {
+      this.emit(this.currentState(), 'Демонстрация экрана доступна только на ПК');
+      return false;
+    }
+    if (!this.pc || this.status !== 'active') return false;
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: 15 },
+        audio: false,
+      });
+      const track = stream.getVideoTracks()[0];
+      if (!track) throw new Error('no track');
+      this.screenStream = stream;
+      track.onended = () => {
+        this._stopScreen();
+        this.emit(this.currentState(), 'Демонстрация остановлена');
+      };
+      const sender = this.pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+      if (sender) {
+        await sender.replaceTrack(track);
+        // Камеру глушим — CPU/трафик на экран, как в Discord.
+        const cam = this._camTrack();
+        if (cam) { this._camWasOn = true; cam.enabled = false; }
+      } else {
+        this.local.addTrack(track);
+        this.pc.addTrack(track, this.local);
+        await this._renegotiate();
+      }
+      this.sharing = true;
+      this.emit(this.currentState());
+      return true;
+    } catch (e) {
+      console.warn('screen:', e);
+      if (String(e?.name) !== 'NotAllowedError') {
+        this.emit(this.currentState(), 'Не удалось показать экран');
+      }
+      this.screenStream = null;
+      return false;
+    }
+  }
+
+  _stopScreen() {
+    try { this.screenStream?.getTracks().forEach((t) => t.stop()); } catch { /* уже */ }
+    this.screenStream = null;
+    this.sharing = false;
+    if (this.pc && this.status === 'active') {
+      const sender = this.pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+      const cam = this._camTrack();
+      if (sender && cam) {
+        cam.enabled = !!this._camWasOn; // возвращаем, как было до шаринга
+        try { sender.replaceTrack(cam); } catch { /* re-neg ниже */ }
+      }
+    }
+    this._camWasOn = false;
+  }
+
+  // --- Ренеготиация на живом звонке (добавили камеру/экран в аудио-звонок):
+  // out-direction шлёт call_renegotiate_offer, in-direction отвечает answer.
+  async _renegotiate() {
+    if (!this.pc || this._renegotiating) return;
+    this._renegotiating = true;
+    try {
+      const offer = await this.pc.createOffer();
+      await this.pc.setLocalDescription(offer);
+      this.sendSignal({ type: 'call_renegotiate_offer', to: this.peer, sdp: offer });
+    } catch (e) {
+      console.warn('reneg offer:', e);
+    } finally {
+      this._renegotiating = false;
+    }
+  }
+
+  // --- Качество связи для оверлея: RTT снизу попугаев → человеко-понятно.
+  async getQuality() {
+    if (!this.pc || this.status !== 'active') return null;
+    try {
+      const stats = await this.pc.getStats();
+      let rtt = null;
+      stats.forEach((r) => {
+        if ((r.type === 'candidate-pair' && r.nominated) || (r.type === 'candidate-pair' && r.state === 'succeeded')) {
+          if (r.currentRoundTripTime != null) rtt = Math.round(r.currentRoundTripTime * 1000);
+        }
+      });
+      if (rtt == null) return null;
+      const label = rtt < 120 ? 'отлично' : rtt < 300 ? 'средне' : 'слабо';
+      return { rtt, label };
+    } catch {
+      return null;
+    }
+  }
+
   // --- Входящие кадры call_* из WS ---
   handleSignal(ev) {
     switch (ev.type) {
@@ -313,6 +477,31 @@ export class CallEngine {
         }
         return;
       }
+      case 'call_renegotiate_offer':
+        // Собеседник добавил камеру/экран на живом звонке.
+        if (this.pc && ev.sdp) {
+          this.pc.setRemoteDescription(new RTCSessionDescription(ev.sdp))
+            .then(async () => {
+              const answer = await this.pc.createAnswer();
+              await this.pc.setLocalDescription(answer);
+              this.sendSignal({ type: 'call_renegotiate_answer', to: ev.fromName, sdp: answer });
+            })
+            .catch((e) => console.warn('reneg remote offer:', e));
+        }
+        return;
+      case 'call_renegotiate_answer':
+        if (this.pc && ev.sdp) {
+          this.pc.setRemoteDescription(new RTCSessionDescription(ev.sdp))
+            .then(() => {
+              const queued = this.queueIce;
+              this.queueIce = [];
+              queued.forEach((c) => {
+                try { this.pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) { console.warn('ice:', e); }
+              });
+            })
+            .catch((e) => console.warn('reneg answer:', e));
+        }
+        return;
       case 'call_answer':
         if (this.pc && ev.sdp) {
           this.status = 'connecting';
@@ -390,6 +579,13 @@ export class CallEngine {
       if (st === 'connected') {
         stopRingLoop();
         this.status = 'active';
+        // После соединения разрешаем ренеготиацию (добавление камеры/экрана
+        // в аудио-звонок) — до этого addTrack-рено бы ломали первичный оффер.
+        if (!this.pc.onnegotiationneeded) {
+          this.pc.onnegotiationneeded = () => {
+            if (this.status === 'active' && !this._renegotiating) this._renegotiate();
+          };
+        }
         this.emit(this.currentState());
       } else if (st === 'failed' || st === 'disconnected' || st === 'closed') {
         if (st === 'disconnected') {
@@ -434,6 +630,12 @@ export class CallEngine {
     }
     this.boost = false;
     this._boostOn = false;
+    this.camOn = true;
+    this.sharing = false;
+    try { this.screenStream?.getTracks().forEach((t) => t.stop()); } catch { /* уже */ }
+    this.screenStream = null;
+    this._renegotiating = false;
+    this._camWasOn = false;
     this.peer = null;
     this.direction = null;
     this.status = null;

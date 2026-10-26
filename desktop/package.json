@@ -1,6 +1,6 @@
 {
   "name": "gor-desktop",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "private": true,
   "description": "GOR messenger — desktop client (Tauri 2)",
   "scripts": {

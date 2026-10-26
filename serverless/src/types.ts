@@ -7,6 +7,9 @@ export interface Env {
   ASSETS: Fetcher;
   VERSION: string; // секрет/вар — необязательный, есть дефолт
   GOR_GIPHY_KEY?: string; // ключ GIPHY (optional): без него /api/giphy отдаёт ошибку
+  GOR_AI_KEY?: string;    // ключ нейро-бота (OpenAI-совместимый): без него /api/ai отдаёт ошибку
+  GOR_AI_BASEURL?: string; // дефолт https://api.openai.com/v1
+  GOR_AI_MODEL?: string;  // дефолт gpt-4o-mini
 }
 
 export interface UserRow {

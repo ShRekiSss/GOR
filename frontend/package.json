@@ -1,6 +1,6 @@
 {
   "name": "gor-chat",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "private": true,
   "proxy": "http://localhost:8080",
   "dependencies": {
