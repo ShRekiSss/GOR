@@ -2,7 +2,7 @@
 
 import { Env, Frame } from './types';
 import {
-  User, USERNAME_RE, createSession, hashPassword, rateLimitAuth, tokenFromRequest, userByToken, verifyPassword,
+  User, USERNAME_RE, createSession, hashPassword, profileOf, rateLimitAuth, tokenFromRequest, userByToken, verifyPassword,
 } from './auth';
 import { text } from './index';
 import { sendPush, pushPublicKey } from './push';
@@ -86,17 +86,16 @@ export async function api(req: Request, env: Env): Promise<Response> {
         'INSERT INTO users (username, password_hash) VALUES (?, ?)',
       ).bind(username, hash).run();
       const userID = ins.meta.last_row_id as number;
-      const user: User = { id: userID, username };
 
       const token = await createSession(env, userID);
       await ensureGeneralChat(env, userID);
-      return json({ token, user }, 201);
+      return json({ token, user: await profileOf(env, userID) }, 201);
     }
 
     // login: время выравнивается тем, что в обоих случаях гоняем hash-проверку
     const row = await env.DB.prepare(
-      'SELECT id, username, password_hash FROM users WHERE username = ? COLLATE NOCASE LIMIT 1',
-    ).bind(username).first<{ id: number; username: string; password_hash: string }>();
+      'SELECT id, username, password_hash, banned FROM users WHERE username = ? COLLATE NOCASE LIMIT 1',
+    ).bind(username).first<{ id: number; username: string; password_hash: string; banned?: number }>();
 
     let user: User | null = null;
     if (row) {
@@ -107,10 +106,11 @@ export async function api(req: Request, env: Env): Promise<Response> {
       await verifyPassword('pbkdf2$sha256$i=25000$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=', password);
     }
     if (!user) return text('Неверное имя или пароль', 401);
+    if (row.banned) return text('Аккаунт заблокирован', 403);
 
     await ensureGeneralChat(env, user.id);
     const token = await createSession(env, user.id);
-    return json({ token, user }, 200);
+    return json({ token, user: await profileOf(env, user.id) }, 200);
   }
 
   if (path === '/api/auth/logout') {
@@ -126,6 +126,7 @@ export async function api(req: Request, env: Env): Promise<Response> {
   if (!isUploads && path !== '/api/download') {
     const authUser = await userByToken(env, tokenFromRequest(req));
     if (!authUser) return text('Не авторизован', 401);
+    if (authUser.banned) return text('Аккаунт заблокирован', 403);
     return apiRest(req, env, authUser);
   }
   // Для /uploads/* и /api/download токен вычисляем здесь: Bearer/cookie либо ?t=.
@@ -133,6 +134,7 @@ export async function api(req: Request, env: Env): Promise<Response> {
     tokenFromRequest(req) || new URL(req.url).searchParams.get('t') || '';
   const mediaUser = maybeToken ? await userByToken(env, maybeToken) : null;
   if (!mediaUser) return text('Не авторизован', 401);
+  if (mediaUser.banned) return text('Аккаунт заблокирован', 403);
   return apiMedia(req, env, mediaUser);
 }
 
@@ -145,6 +147,63 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
   // ---------- me / users ----------
   if (path === '/api/auth/me' && req.method === 'GET') {
     return json({ user });
+  }
+
+  // ---------- Админка (права разраба; фича пока только в облаке) ----------
+  if (path.startsWith('/api/admin')) {
+    if (!user.isAdmin) return text('Нет прав', 403);
+    return adminApi(req, env, user);
+  }
+
+  // Свой профиль: полный, со счётчиками разделов.
+  if (path === '/api/me/profile' && req.method === 'GET') {
+    const me = await profileOf(env, user.id);
+    if (!me) return text('Не найдено', 404);
+    // Друзья — люди, с которыми есть личный чат (пока без отдельной соцсети).
+    const fr = await env.DB.prepare(
+      `SELECT COUNT(DISTINCT m.user_id) AS n FROM chat_members a
+       JOIN chats c ON c.id = a.chat_id AND c.type = 'direct'
+       JOIN chat_members m ON m.chat_id = c.id AND m.user_id != a.user_id
+       WHERE a.user_id = ?`,
+    ).bind(user.id).first<{ n: number }>();
+    return json({
+      user: me,
+      counts: { photos: 0, notes: 0, links: 0, friends: fr?.n || 0 },
+      permissions: { canEdit: true },
+    });
+  }
+
+  // Правка своего профиля: displayName / bio / statusText / statusEmoji.
+  if (path === '/api/me/profile' && req.method === 'PATCH') {
+    let body: { displayName?: string; bio?: string; statusText?: string; statusEmoji?: string };
+    try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
+    const dn = String(body.displayName ?? '').trim();
+    const bio = String(body.bio ?? '').trim();
+    const st = String(body.statusText ?? '').trim();
+    const se = String(body.statusEmoji ?? '').trim();
+    if (dn.length > 48 || bio.length > 280 || st.length > 64 || [...se].length > 4) {
+      return text('Слишком длинные данные профиля', 400);
+    }
+    await env.DB.prepare(
+      'UPDATE users SET display_name = ?, bio = ?, status_text = ?, status_emoji = ? WHERE id = ?',
+    ).bind(dn, bio, st, se, user.id).run();
+    return json({ user: await profileOf(env, user.id) });
+  }
+
+  // Публичный профиль по @username: только безопасная часть.
+  const pubUser = (seg[0] === 'api' && seg[1] === 'users' && seg[3] === 'profile' && seg[2]) ? seg[2] : null;
+  if (pubUser && req.method === 'GET') {
+    const row = await env.DB.prepare(
+      'SELECT id, username, avatar, is_admin, display_name, bio, status_text, status_emoji FROM users WHERE username = ? COLLATE NOCASE LIMIT 1',
+    ).bind(pubUser).first<any>();
+    if (!row) return text('Не найдено', 404);
+    return json({ user: {
+      id: row.id, username: row.username, avatar: row.avatar || '',
+      isAdmin: row.is_admin || 0,
+      displayName: row.display_name || '', bio: row.bio || '',
+      statusText: row.status_text || '', statusEmoji: row.status_emoji || '',
+      presence: 'offline',
+    } });
   }
 
   // Смена аватара профиля: { dataUrl: 'data:image/png;base64,...' } (можно и через
@@ -643,4 +702,59 @@ async function uploadsRead(req: Request, env: Env, user: User, rawName: string):
   headers.set('cache-control', 'private, max-age=3600');
   headers.set('x-content-type-options', 'nosniff');
   return new Response(file.bytes, { headers });
+}
+
+// ---------- Админка: права разраба (бан, переминовка, лист входов) ----------
+// Фича пока только в облаке (в main.go соответствия нет — см. дорожную карту).
+async function adminApi(req: Request, env: Env, me: User): Promise<Response> {
+  const url = new URL(req.url);
+  const path = url.pathname;
+  const seg = path.split('/').filter(Boolean);
+  // seg: ['api','admin','users'] | ['api','admin','users',':id','ban'|'rename']
+
+  if (path === '/api/admin/users' && req.method === 'GET') {
+    const rows = await env.DB.prepare(
+      `SELECT u.id, u.username, u.avatar, u.is_admin, u.banned,
+              u.created_at,
+              (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.expires_at > (SELECT strftime('%s','now'))) AS sessions_alive,
+              (SELECT MAX(s.created_at) FROM sessions s WHERE s.user_id = u.id) AS last_login,
+              (SELECT MAX(m.timestamp) FROM messages m WHERE m.user_id = u.id) AS last_message
+       FROM users u ORDER BY u.id`,
+    ).all<any>();
+    return json({ users: rows.results || [] });
+  }
+
+  if (seg[1] === 'admin' && seg[2] === 'users' && Number.isInteger(Number(seg[3])) && Number(seg[3]) > 0) {
+    const target = Number(seg[3]);
+    if (req.method === 'POST' && seg[4] === 'ban') {
+      if (target === me.id) return text('Нельзя забанить самого себя', 400);
+      let body: { on?: boolean };
+      try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
+      const on = body.on !== false;
+      await env.DB.prepare(
+        `UPDATE users SET banned = ? WHERE id = ?`,
+      ).bind(on ? 1 : 0, target).run();
+      if (on) {
+        // Бан убивает входы: живые сессии и пуш-подписки зануляем.
+        await env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(target).run();
+        await env.DB.prepare('DELETE FROM push_subscriptions WHERE user_id = ?').bind(target).run();
+      }
+      return json({ ok: true, banned: on });
+    }
+    if (req.method === 'POST' && seg[4] === 'rename') {
+      let body: { username?: string };
+      try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
+      const name = String(body.username || '').trim();
+      if (!USERNAME_RE.test(name)) return text('Имя: 3-32 символа, латиница, цифры, _ . -', 400);
+      const exists = await env.DB.prepare(
+        'SELECT id FROM users WHERE username = ? COLLATE NOCASE LIMIT 1',
+      ).bind(name).first<{ id: number }>();
+      if (exists && exists.id !== target) return text('Это имя уже занято', 409);
+      await env.DB.prepare('UPDATE users SET username = ? WHERE id = ?').bind(name, target).run();
+      return json({ ok: true, user: await profileOf(env, target) });
+    }
+    return text('Method not allowed', 405);
+  }
+
+  return text('Не найдено', 404);
 }

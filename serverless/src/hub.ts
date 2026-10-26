@@ -92,7 +92,8 @@ export class Hub {
     if (s.userID === 0) {
       if (data?.type === 'auth' && data?.token) {
         const user = await userByToken(this.env, data.token);
-        if (!user) {
+        // Бан гасит и WS: без живых сокетов забаненный никуда не пишет.
+        if (!user || user.banned) {
           this.sendTo(conID, s, { type: 'auth_error' });
           try { s.ws.close(1008, 'auth_error'); } catch { /* уже */ }
           this.sockets.delete(conID);

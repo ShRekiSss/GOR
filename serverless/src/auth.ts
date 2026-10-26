@@ -7,6 +7,12 @@ export interface User {
   id: number;
   username: string;
   avatar?: string;
+  displayName?: string;
+  bio?: string;
+  statusText?: string;
+  statusEmoji?: string;
+  isAdmin?: number;
+  banned?: number;
 }
 
 // PBKDF2-SHA256, 25 000 итераций — бесплатно по CPU и достаточно против оффлайн-брута.
@@ -100,11 +106,28 @@ export async function userByToken(env: Env, token: string): Promise<User | null>
   if (!token) return null;
   const now = Math.floor(Date.now() / 1000);
   const row = await env.DB.prepare(
-    `SELECT u.id, u.username, u.avatar FROM sessions s JOIN users u ON u.id = s.user_id
+    `SELECT u.id, u.username, u.avatar, u.is_admin, u.banned FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token = ? AND s.expires_at > ? LIMIT 1`,
-  ).bind(token, now).first<UserRow & { avatar?: string }>();
+  ).bind(token, now).first<UserRow & { avatar?: string; is_admin?: number; banned?: number }>();
   if (!row) return null;
-  return { id: row.id, username: row.username, avatar: row.avatar || '' };
+  return {
+    id: row.id, username: row.username, avatar: row.avatar || '',
+    isAdmin: row.is_admin || 0, banned: row.banned || 0,
+  };
+}
+
+// Полный профиль из users (для /api/me/profile и публичных страниц).
+export async function profileOf(env: Env, id: number): Promise<User | null> {
+  const row = await env.DB.prepare(
+    'SELECT id, username, avatar, is_admin, banned, display_name, bio, status_text, status_emoji FROM users WHERE id = ? LIMIT 1',
+  ).bind(id).first<any>();
+  if (!row) return null;
+  return {
+    id: row.id, username: row.username, avatar: row.avatar || '',
+    isAdmin: row.is_admin || 0, banned: row.banned || 0,
+    displayName: row.display_name || '', bio: row.bio || '',
+    statusText: row.status_text || '', statusEmoji: row.status_emoji || '',
+  };
 }
 
 // ---------- Лимитер (/api/auth/*): 20 попыток / 5 минут на IP ----------

@@ -4,6 +4,12 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT NOT NULL UNIQUE COLLATE NOCASE,
     password_hash TEXT NOT NULL,
     avatar TEXT,
+    is_admin INTEGER NOT NULL DEFAULT 0,
+    banned INTEGER NOT NULL DEFAULT 0,
+    display_name TEXT NOT NULL DEFAULT '',
+    bio TEXT NOT NULL DEFAULT '',
+    status_text TEXT NOT NULL DEFAULT '',
+    status_emoji TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
