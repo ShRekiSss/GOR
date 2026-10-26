@@ -174,9 +174,9 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
     });
   }
 
-  // Правка своего профиля: displayName / bio / statusText / statusEmoji.
+  // Правка своего профиля: displayName / bio / statusText / statusEmoji / searchable.
   if (path === '/api/me/profile' && req.method === 'PATCH') {
-    let body: { displayName?: string; bio?: string; statusText?: string; statusEmoji?: string };
+    let body: { displayName?: string; bio?: string; statusText?: string; statusEmoji?: string; searchable?: number | boolean };
     try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
     const dn = String(body.displayName ?? '').trim();
     const bio = String(body.bio ?? '').trim();
@@ -188,6 +188,19 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
     await env.DB.prepare(
       'UPDATE users SET display_name = ?, bio = ?, status_text = ?, status_emoji = ? WHERE id = ?',
     ).bind(dn, bio, st, se, user.id).run();
+    // Приватность: скрыть/показать себя в поиске людей. Если миграция D1 ещё
+    // не применена — честно говорим «прими миграции» вместо немого провала.
+    if (body.searchable !== undefined) {
+      const sv = Number(body.searchable) ? 1 : 0;
+      try {
+        await env.DB.prepare('UPDATE users SET searchable = ? WHERE id = ?').bind(sv, user.id).run();
+      } catch (e: any) {
+        if (String(e?.message || e).includes('no such column')) {
+          return text('Миграция D1 не применена: ALTER TABLE users ADD COLUMN searchable (см. migrations/)', 400);
+        }
+        throw e;
+      }
+    }
     return json({ user: await profileOf(env, user.id) });
   }
 
@@ -231,6 +244,21 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
     const du = String(body.dataUrl || '');
     if (!/^data:image\/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=]+$/.test(du)) {
       return text('Формат изображения не поддержан', 400);
+    }
+    const b64 = du.slice(du.indexOf(',') + 1);
+    if (b64.length < 24 || b64.length % 4 !== 0) {
+      return text('Повреждённая картинка', 400);
+    }
+    // Магические байты: JPEG (FF D8 FF) или PNG (89 50 4E 47) — иначе «Картинка
+    // повреждена»: старые обрезанные/битые data-URL больше не дойдут до D1.
+    try {
+      const head = atob(b64.slice(0, 8));
+      const b = [head.charCodeAt(0), head.charCodeAt(1), head.charCodeAt(2), head.charCodeAt(3)];
+      const isJpeg = b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF;
+      const isPng = b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47;
+      if (!isJpeg && !isPng) return text('Повреждённая картинка', 400);
+    } catch {
+      return text('Повреждённая картинка', 400);
     }
     if (du.length > 400_000) {
       return text('Слишком большая картинка (лимит ~300 КиБ)', 400);
@@ -306,10 +334,33 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
   if (path === '/api/users' && req.method === 'GET') {
     const q = (url.searchParams.get('q') || '').trim();
     const pattern = `%${q}%`;
-    const rows = await env.DB.prepare(
-      'SELECT id, username, avatar FROM users WHERE id != ? AND username LIKE ? ORDER BY username LIMIT 20',
-    ).bind(user.id, pattern).all<User & { avatar?: string }>();
-    return json({ users: (rows.results || []).map((u) => ({ ...u, avatar: u.avatar || '' })) });
+    // Приватность: скрытые из поиска (searchable=0) не попадают в выдачу,
+    // НО остаются видимыми тем, у кого с ними уже есть личный чат.
+    const PRIV = `AND (u.searchable = 1 OR u.id IN (
+        SELECT other.user_id FROM chat_members me
+        JOIN chats c ON c.id = me.chat_id AND c.type = 'direct'
+        JOIN chat_members other ON other.chat_id = me.chat_id
+        WHERE me.user_id = ? AND other.user_id != me.user_id
+      ))`;
+    const base = (withPriv: string) => (
+      `SELECT u.id, u.username, u.avatar FROM users u
+       WHERE u.id != ? AND u.username LIKE ? ${withPriv}
+       ORDER BY u.username LIMIT 20`
+    );
+    try {
+      const rows = await env.DB.prepare(base(PRIV))
+        .bind(user.id, pattern, user.id).all<any>();
+      return json({ users: (rows.results || []).map((u) => ({ ...u, avatar: u.avatar || '' })) });
+    } catch (e: any) {
+      if (String(e?.message || e).includes('no such column')) {
+        // Миграция не применена — старое поведение (всех видно).
+        const rows = await env.DB.prepare(
+          'SELECT id, username, avatar FROM users WHERE id != ? AND username LIKE ? ORDER BY username LIMIT 20',
+        ).bind(user.id, pattern).all<User & { avatar?: string }>();
+        return json({ users: (rows.results || []).map((u) => ({ ...u, avatar: u.avatar || '' })) });
+      }
+      throw e;
+    }
   }
 
   // ---------- chats ----------

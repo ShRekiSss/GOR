@@ -99,6 +99,10 @@ export class CallEngine {
     this.muted = false;
     this.iceOpen = false;   // зовём addIceCandidate только после setRemote
     this.queueIce = [];
+    // «На динамик»: WebAudio-усиление удалённого потока (громкость ~2×).
+    this.boost = false;
+    this._boostOn = false;
+    this.audioGraph = null; // { ctx, src, gain } — создаётся при первом потоке
   }
 
   emit(state, toast) {
@@ -113,8 +117,54 @@ export class CallEngine {
           status: this.status,
           stream: this.remote,
           muted: this.muted,
+          boost: this.boost,
+          audioRouted: !!this.audioGraph,
         }
       : null;
+  }
+
+  // --- Аудиомаршрут: до 1× играет сам <audio>-элемент; при бусте включаем
+  // WebAudio (src → gain → destination) и глушим элемент, иначе двойной звук.
+  _ensureGraph() {
+    if (this.audioGraph || !this.remote || !MEDIA_OK) return !!this.audioGraph;
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const src = ctx.createMediaStreamSource(this.remote);
+      const gain = ctx.createGain();
+      src.connect(gain);
+      gain.connect(ctx.destination);
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      this.audioGraph = { ctx, src, gain };
+    } catch (e) {
+      console.warn('boost ctx:', e);
+      this.audioGraph = null;
+    }
+    return !!this.audioGraph;
+  }
+
+  _applyBoost() {
+    if (this._boostOn) {
+      if (this._ensureGraph()) {
+        // Резкий подъём на «динамик»: ~2× поверх штатной громкости.
+        this.audioGraph.gain.gain.value = 2.0;
+        if (this.audioGraph.ctx.state === 'suspended') {
+          this.audioGraph.ctx.resume().catch(() => {});
+        }
+      }
+    } else if (this.audioGraph) {
+      // 1× — через graph всё ещё играем (элемент заглушён в буст-режиме? нет:
+      // muted управляется снаружи по call.boost) — просто тихо.
+      this.audioGraph.gain.gain.value = 1.0;
+    }
+  }
+
+  // Переключатель «громкость на динамик»: 1× → ×2.
+  toggleBoost() {
+    this._boostOn = !this._boostOn;
+    this.boost = this._boostOn;
+    this._applyBoost();
+    this.emit(this.currentState());
+    return this._boostOn;
   }
 
   // --- Исходящий звонок: getUserMedia + offer сразу (Discord-семантика быстрая) ---
@@ -331,6 +381,8 @@ export class CallEngine {
     };
     this.pc.ontrack = (e) => {
       this.remote = e.streams[0];
+      // Поток появился — перенастраиваем громкость (граф создаётся лениво).
+      this._applyBoost();
       this.emit(this.currentState());
     };
     this.pc.onconnectionstatechange = () => {
@@ -374,6 +426,14 @@ export class CallEngine {
     } catch { /* уже */ }
     this.local = null;
     this.remote = null;
+    // Аудиограф буста — останавливаем, иначе ctx живёт и жрёт батарею.
+    if (this.audioGraph) {
+      try { this.audioGraph.src.disconnect(); this.audioGraph.gain.disconnect(); } catch { /* уже */ }
+      try { this.audioGraph.ctx.close(); } catch { /* уже */ }
+      this.audioGraph = null;
+    }
+    this.boost = false;
+    this._boostOn = false;
     this.peer = null;
     this.direction = null;
     this.status = null;

@@ -143,6 +143,57 @@ function App() {
   const [profileDraft, setProfileDraft] = useState(null);
   // Web Push: поддержан ли браузером и включён ли (для тумблера в настройках).
   const [pushInfo, setPushInfo] = useState({ supported: false, on: false, busy: false });
+  // Темы: 'dark' (дефолт) | 'light' | 'custom' (свой CSS, загруженный файлом).
+  const [theme, setThemeState] = useState(() => {
+    try { return localStorage.getItem('vaksa.theme') || 'dark'; } catch { return 'dark'; }
+  });
+  const [customThemeCss, setCustomThemeCss] = useState(() => {
+    try { return localStorage.getItem('vaksa.customTheme') || ''; } catch { return ''; }
+  });
+  const customThemeInputRef = useRef(null);
+  // Приватность поиска: null = ещё не знаем; 1 виден / 0 скрыт.
+  const [searchable, setSearchable] = useState(null);
+  // Кнопка «вниз» в ленте чата.
+  const [showJump, setShowJump] = useState(false);
+
+  const setTheme = (next) => {
+    setThemeState(next);
+    try { localStorage.setItem('vaksa.theme', next); } catch { /* приватный режим */ }
+  };
+
+  const saveCustomTheme = (css) => {
+    // Очистка: @import тянет чужие ресурсы, JS-выражения в CSS мертвы, но
+    // повыдёргиваем на всякий случай. Всё остальное — цвета/шрифты/градиенты.
+    let safe = String(css || '');
+    safe = safe.replace(/@import[^;]+;?/gi, '/* @import убран */');
+    safe = safe.replace(/javascript:/gi, '/* */:');
+    safe = safe.replace(/expression\s*\(/gi, '/**/ (');
+    safe = safe.slice(0, 200_000);
+    setCustomThemeCss(safe);
+    try { localStorage.setItem('vaksa.customTheme', safe); } catch { /* приватный режим */ }
+  };
+
+  const loadThemeFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (file.size > 300_000) {
+      showToast('Файл темы слишком большой (>300 КиБ)');
+      return;
+    }
+    try {
+      const text = await file.text();
+      if (!/\.css$/i.test(file.name) && !/\{[^}]*:[^}]*\}/.test(text)) {
+        showToast('Это не похоже на CSS-файл');
+        return;
+      }
+      saveCustomTheme(text);
+      setTheme('custom');
+      showToast('Тема применена');
+    } catch {
+      showToast('Не удалось прочитать файл темы');
+    }
+  };
 
   // --- Мобильный режим (Android/PWA): жесты в стиле Signal-Android ---
   const [isMobile, setIsMobile] = useState(() => window.matchMedia(MOBILE_MQ).matches);
@@ -756,6 +807,11 @@ function App() {
     const container = messagesContainerRef.current;
     if (container && container.scrollTop < 60) {
       loadOlder();
+    }
+    // Кнопка «вниз»: показываем, когда смотришь не конец ленты.
+    if (container) {
+      const gap = container.scrollHeight - container.scrollTop - container.clientHeight;
+      setShowJump(gap > 320);
     }
   };
 
@@ -1385,6 +1441,18 @@ function App() {
     if (isMobileRef.current) {
       pushLayer('settings');
     }
+    // Тумблер «виден в поиске» — берём с сервера.
+    try {
+      const r = await authFetch('/api/me/profile');
+      if (r.ok) {
+        const d = await r.json();
+        setSearchable(d.user?.searchable ?? 1);
+      } else {
+        setSearchable(null);
+      }
+    } catch {
+      setSearchable(null);
+    }
     if (isDesktop()) {
       try {
         const plugin = await import('@tauri-apps/plugin-autostart');
@@ -1395,7 +1463,24 @@ function App() {
     }
   };
 
-  // Смена аватара: файл → canvas 128×128 → data URL → POST /api/me/avatar.
+  // Смена аватара: файл → окно кадрирования (зум/перетаскивание) → canvas 128×128 → POST /api/me/avatar.
+  const [cropPic, setCropPic] = useState(null);   // { dataUrl, w, h }
+  const [cropZoom, setCropZoom] = useState(1);
+  const [cropOff, setCropOff] = useState({ x: 0, y: 0 });
+  const cropDragRef = useRef(null);
+  const cropPinchRef = useRef(null);
+  const CROP_BOX = 240;
+
+  const cropScale = cropPic ? Math.max(CROP_BOX / cropPic.w, CROP_BOX / cropPic.h) * cropZoom : 1;
+  const cropClampOff = (o, zoom) => {
+    if (!cropPic) return o;
+    const visW = cropPic.w * Math.max(CROP_BOX / cropPic.w, CROP_BOX / cropPic.h) * zoom;
+    const visH = cropPic.h * Math.max(CROP_BOX / cropPic.w, CROP_BOX / cropPic.h) * zoom;
+    const mx = Math.max(0, (visW - CROP_BOX) / 2);
+    const my = Math.max(0, (visH - CROP_BOX) / 2);
+    return { x: Math.max(-mx, Math.min(mx, o.x)), y: Math.max(-my, Math.min(my, o.y)) };
+  };
+
   const handleAvatarFile = async (e) => {
     const file = e.target.files?.[0];
     e.target.value = '';
@@ -1413,11 +1498,36 @@ function App() {
       });
       const img = new Image();
       await new Promise((resolve, reject) => { img.onload = resolve; img.onerror = reject; img.src = dataUrl; });
-      const side = Math.min(img.width, img.height);
+      // Не даём гигантские картинки — до ~14 Мп иначе canvas душнит телефон.
+      if (img.width * img.height > 14_000_000) {
+        showToast('Слишком большая картинка');
+        return;
+      }
+      setCropZoom(1);
+      setCropOff({ x: 0, y: 0 });
+      setCropPic({ dataUrl, w: img.width, h: img.height });
+    } catch {
+      showToast('Не удалось прочитать картинку');
+    }
+  };
+
+  const closeCrop = () => setCropPic(null);
+
+  const submitCrop = async () => {
+    if (!cropPic) return;
+    const s = cropScale;
+    const srcW = CROP_BOX / s, srcH = CROP_BOX / s;
+    const cx = cropPic.w / 2 + cropOff.x / s;
+    const cy = cropPic.h / 2 + cropOff.y / s;
+    const sx = Math.max(0, Math.min(cropPic.w - srcW, cx - srcW / 2));
+    const sy = Math.max(0, Math.min(cropPic.h - srcH, cy - srcH / 2));
+    try {
       const canvas = document.createElement('canvas');
       canvas.width = 128; canvas.height = 128;
       const ctx = canvas.getContext('2d');
-      ctx.drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, 128, 128);
+      const img = new Image();
+      await new Promise((resolve, reject) => { img.onload = resolve; img.onerror = reject; img.src = cropPic.dataUrl; });
+      ctx.drawImage(img, sx, sy, srcW, srcH, 0, 0, 128, 128);
       const cropped = canvas.toDataURL('image/jpeg', 0.85);
       const response = await authFetch('/api/me/avatar', {
         method: 'POST',
@@ -1432,14 +1542,49 @@ function App() {
         setUser(data.user);
         rememberAvatar(data.user.username, data.user.avatar);
       }
+      setCropPic(null);
       showToast('Аватар обновлён');
     } catch (error) {
       showToast(`Не удалось сменить аватар: ${error.message}`);
     }
   };
 
-  const toggleAutostart = async () => {
+  // Применяем тему к документу: атрибут + свой CSS (только для 'custom').
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme === 'custom' ? 'custom' : theme);
+    let tag = document.querySelector('style[data-vaksa-custom]');
+    if (!tag) {
+      tag = document.createElement('style');
+      tag.setAttribute('data-vaksa-custom', '');
+      document.head.appendChild(tag);
+    }
+    tag.textContent = theme === 'custom' ? customThemeCss : '';
+  }, [theme, customThemeCss]);
+
+  // Приватность: не показывать меня в поиске людей.
+  const toggleSearchable = async (visible) => {
+    const next = visible ? 1 : 0;
+    setSearchable(next);
     try {
+      const r = await authFetch('/api/me/profile', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ searchable: next }),
+      });
+      if (!r.ok) {
+        const t = await r.text();
+        setSearchable(visible ? 0 : 1);
+        showToast(t.trim() || 'Не переключилось');
+      } else {
+        showToast(visible ? 'Вас видно в поиске' : 'Вы скрыты из поиска');
+      }
+    } catch {
+      setSearchable(visible ? 0 : 1);
+      showToast('Сеть дрогнула — не переключилось');
+    }
+  };
+
+  const toggleAutostart = async () => {    try {
       const plugin = await import('@tauri-apps/plugin-autostart');
       if (autostart) {
         await plugin.disable();
@@ -1818,6 +1963,8 @@ function App() {
     pressTimerRef.current = setTimeout(() => {
       longPressRef.current = true;
       setContextChat(chat);
+      // Android-тактиль: длинный тап ощущается «кнопкой».
+      try { navigator.vibrate?.(15); } catch { /* нет vibrate */ }
       if (isMobileRef.current) {
         pushLayer('context');
       }
@@ -1843,6 +1990,7 @@ function App() {
     pressTimerRef.current = setTimeout(() => {
       longPressRef.current = true;
       setMsgMenu(msg);
+      try { navigator.vibrate?.(15); } catch { /* нет vibrate */ }
     }, 420);
   };
 
@@ -2173,6 +2321,47 @@ function App() {
 
   return (
     <div className={`app-shell ${isMobile ? 'mobile' : ''}`}>
+      {/* Глобальная полоса звонка — видна из ЛЮБОГО экрана (чаты, профиль,
+          настройки), не пропадает при выходе из чата. */}
+      {call && call.status !== 'ringing' && (
+        <div className={`call-bar global ${call.status}`}>
+          <span className="call-wave" aria-hidden="true" />
+          <div className="call-meta">
+            <strong>@{call.peer}</strong>
+            <span>
+              {call.status === 'active'
+                ? `${String(Math.floor(callSecs / 60)).padStart(2, '0')}:${String(callSecs % 60).padStart(2, '0')}`
+                : call.status === 'outgoing' ? 'звоним…' : 'соединение…'}
+              {!isConnected && ' · нет связи с сервером'}
+            </span>
+          </div>
+          <button
+            type="button"
+            className={`call-btn boost ${call.boost ? 'on' : ''}`}
+            onClick={() => callEngineRef.current?.toggleBoost()}
+            disabled={!call.audioRouted}
+            title={call.boost ? 'Обычная громкость' : 'Громкость на динамик (×2)'}
+          >
+            {call.boost ? '🔊' : '🔈'}
+          </button>
+          <button
+            type="button"
+            className={`call-btn mute ${call.muted ? 'muted' : ''}`}
+            onClick={() => callEngineRef.current?.toggleMute()}
+            title={call.muted ? 'Включить микрофон' : 'Заглушить микрофон'}
+          >
+            {call.muted ? '🔇' : '🎙'}
+          </button>
+          <button
+            type="button"
+            className="call-btn reject"
+            onClick={() => callEngineRef.current?.hangup()}
+            title="Завершить звонок"
+          >
+            ✕
+          </button>
+        </div>
+      )}
       <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
         <div className="sidebar-header">
           <div>
@@ -2261,7 +2450,15 @@ function App() {
             ☰
           </button>
           <div className="chat-heading">
-            <h2>
+            <h2
+              className={activeChat?.type === 'direct' ? 'tappable' : ''}
+              // Тап по имени личного чата — карточка собеседника.
+              onClick={() => {
+                if (activeChat?.type === 'direct' && activeChat.peer) {
+                  openUserProfile(activeChat.peer);
+                }
+              }}
+            >
               {activeChat
                 ? `${activeChat.type === 'group' ? '# ' : '@ '}${activeChat.title || activeChat.peer || 'Чат'}`
                 : 'VAKSA CHAT'}
@@ -2341,36 +2538,7 @@ function App() {
           </div>
         )}
 
-        {/* Полоса активного/исходящего звонка — как полоса Discord-звонка */}
-        {call && call.status !== 'ringing' && (
-          <div className={`call-bar ${call.status}`}>
-            <span className="call-wave" aria-hidden="true" />
-            <div className="call-meta">
-              <strong>@{call.peer}</strong>
-              <span>
-                {call.status === 'active'
-                  ? `${String(Math.floor(callSecs / 60)).padStart(2, '0')}:${String(callSecs % 60).padStart(2, '0')}`
-                  : call.status === 'outgoing' ? 'звоним…' : 'соединение…'}
-              </span>
-            </div>
-            <button
-              type="button"
-              className={`call-btn mute ${call.muted ? 'muted' : ''}`}
-              onClick={() => callEngineRef.current?.toggleMute()}
-              title={call.muted ? 'Включить микрофон' : 'Заглушить микрофон'}
-            >
-              {call.muted ? '🔇' : '🎙'}
-            </button>
-            <button
-              type="button"
-              className="call-btn reject"
-              onClick={() => callEngineRef.current?.hangup()}
-              title="Завершить звонок"
-            >
-              ✕
-            </button>
-          </div>
-        )}
+        {/* Полоса звонка переехала на уровень app-shell — видна из любого экрана. */}
 
         <div
           className={`messages-container ${isDragOver ? 'drag-over' : ''}`}
@@ -2400,8 +2568,7 @@ function App() {
               &gt; Поиск идёт только по загруженной истории чата
             </div>
           )}
-          {loadingOlder && <div className="history-loading">загрузка истории…</div>}
-          {!loadingOlder && canLoadOlder && (
+          {loadingOlder && <div className="history-loading">загрузка истории…</div>}          {!loadingOlder && canLoadOlder && (
             <button type="button" className="history-more" onClick={loadOlder}>
               ⤒ показать более старые сообщения
             </button>
@@ -2424,10 +2591,35 @@ function App() {
                     title="Долгое нажатие — действия"
                   >
                     <div className="msg-head">
-                      {avatars[msg.username]
-                        ? <img className="msg-avatar msg-avatar-img" src={avatars[msg.username]} alt={msg.username} />
-                        : <span className="msg-avatar">{(msg.username?.[0] || '?').toUpperCase()}</span>}
-                      <span className="username-label">[{msg.username}]</span>
+                      {(() => {
+                        // Тап по аватару/нику открывает профиль пользователя
+                        // (кроме системы и своих сообщений).
+                        const canOpen = msg.username !== 'System' && msg.userId !== user?.id;
+                        const open = (e) => {
+                          e.stopPropagation();
+                          e.preventDefault();
+                          if (canOpen) openUserProfile(msg.username);
+                        };
+                        return (
+                          <>
+                            {avatars[msg.username]
+                              ? (
+                                <img
+                                  className={`msg-avatar msg-avatar-img ${canOpen ? 'tappable' : ''}`}
+                                  src={resolveUrl(avatars[msg.username])}
+                                  alt={msg.username}
+                                  onClick={open}
+                                  onError={(e) => { e.currentTarget.classList.add('broken'); }}
+                                />
+                              )
+                              : <span className="msg-avatar">{(msg.username?.[0] || '?').toUpperCase()}</span>}
+                            <span
+                              className={`username-label ${canOpen ? 'tappable' : ''}`}
+                              onClick={open}
+                            >[{msg.username}]</span>
+                          </>
+                        );
+                      })()}
                       <span className="timestamp">{localTime(msg.timestamp)}{msg.edited ? ' (изменено)' : ''}{msg.userId === user?.id ? (readMarks[msg.chatId] >= msg.id ? ' ✓✓' : ' ✓') : ''}</span>
                     </div>
                     {msg.replyTo ? (
@@ -2477,6 +2669,20 @@ function App() {
             )
           ))}
           <div ref={messagesEndRef} />
+          {/* Прыжок к свежим сообщениям — как у Telegram. */}
+          {showJump && activeChat && (
+            <button
+              type="button"
+              className="jump-bottom"
+              onClick={() => {
+                messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+                setShowJump(false);
+              }}
+              title="Вниз к новым сообщениям"
+            >
+              ⤓
+            </button>
+          )}
         </div>
 
         {stickerPanelOpen && (
@@ -2596,6 +2802,14 @@ function App() {
               {msgMenu.type !== 'deleted' && msgMenu.username !== 'System' && (
                 <button type="button" onClick={() => { setReplyTo(msgMenu); setEditingMsg(null); setMsgMenu(null); }}>
                   ↩ Ответить
+                </button>
+              )}
+              {msgMenu.username !== 'System' && msgMenu.userId !== user?.id && (
+                <button
+                  type="button"
+                  onClick={() => { setMsgMenu(null); openUserProfile(msgMenu.username); }}
+                >
+                  👤 Профиль
                 </button>
               )}
               {msgMenu.type === 'text' && msgMenu.text && msgMenu.username !== 'System' && (
@@ -2834,6 +3048,66 @@ function App() {
               </label>
             )}
 
+            {/* Темы: тёмная / светлая / своя (CSS-файл) */}
+            <div className="settings-label">Тема</div>
+            <div className="theme-row" role="group" aria-label="Тема оформления">
+              {[
+                { id: 'dark', title: 'Тёмная', icon: '🌙' },
+                { id: 'light', title: 'Светлая', icon: '☀️' },
+                { id: 'custom', title: 'Своя', icon: '🎨' },
+              ].map((t) => (
+                <button
+                  key={t.id}
+                  type="button"
+                  className={`theme-option ${theme === t.id ? 'active' : ''}`}
+                  onClick={() => setTheme(t.id)}
+                >
+                  {t.icon} {t.title}
+                </button>
+              ))}
+            </div>
+            {theme === 'custom' && (
+              <div className="custom-theme-block">
+                <button
+                  type="button"
+                  className="avatar-change"
+                  onClick={() => customThemeInputRef.current?.click()}
+                >
+                  Загрузить CSS-файл…
+                </button>
+                <input
+                  ref={customThemeInputRef}
+                  type="file"
+                  accept=".css,text/css"
+                  onChange={loadThemeFile}
+                  style={{ display: 'none' }}
+                />
+                <textarea
+                  className="setup-input custom-theme-textarea"
+                  rows={5}
+                  spellCheck={false}
+                  placeholder="Или вставь свой CSS целиком…"
+                  value={customThemeCss}
+                  onChange={(e) => saveCustomTheme(e.target.value)}
+                />
+                <span className="custom-theme-hint">
+                  Пример: <code>.app-shell&#123;background:#202a36;color:#dce8f4;&#125;</code>
+                </span>
+              </div>
+            )}
+
+            {/* Приватность: видимость в поиске людей */}
+            {searchable !== null && (
+              <label className="settings-check">
+                <input
+                  type="checkbox"
+                  checked={searchable === 1}
+                  onChange={(e) => toggleSearchable(e.target.checked)}
+                />
+                Показывать меня в поиске людей
+              </label>
+            )}
+
             {pushInfo.supported && (
               <label className="settings-check">
                 <input
@@ -2948,9 +3222,11 @@ function App() {
               <>
                 <div className="profile-hero">
                   <span className="profile-avatar">
+                    {/* Буква остаётся под картинкой — битый/повреждённый аватар
+                        не делает карточку «пустой»: img сам убирается по onError. */}
+                    {(profileData.displayName || profileData.username || '?').charAt(0).toUpperCase()}
                     {profileData.avatar
-                      ? <img src={resolveUrl(profileData.avatar)} alt="аватар" />
-                      : (profileData.displayName || profileData.username || '?').charAt(0).toUpperCase()}
+                      && <img src={resolveUrl(profileData.avatar)} alt="аватар" onError={(e) => { e.currentTarget.remove(); }} />}
                   </span>
                   <div className="profile-identity">
                     <div className="profile-name">
@@ -3109,6 +3385,99 @@ function App() {
       {/* --- Мобильные жестовые элементы (FAB, нижние листы, toast) --- */}
       {isMobile && !mobileChatOpen && (
         <button type="button" className="compose-fab" onClick={openCompose} aria-label="Новый чат">＋</button>
+      )}
+
+      {/* Окно кадрирования аватара: зум-ползунок + перетаскивание + пинч. */}
+      {cropPic && (
+        <div className="crop-overlay" onClick={closeCrop}>
+          <div className="crop-card" onClick={(e) => e.stopPropagation()}>
+            <h2>Аватар</h2>
+            <div
+              className="crop-box"
+              onPointerDown={(e) => {
+                e.currentTarget.setPointerCapture?.(e.pointerId);
+                cropDragRef.current = { x0: e.clientX, y0: e.clientY, ox: cropOff.x, oy: cropOff.y };
+              }}
+              onPointerMove={(e) => {
+                const drag = cropDragRef.current;
+                if (!drag) return;
+                setCropOff(cropClampOff({
+                  x: drag.ox + (e.clientX - drag.x0),
+                  y: drag.oy + (e.clientY - drag.y0),
+                }, cropZoom));
+              }}
+              onPointerUp={() => { cropDragRef.current = null; }}
+              onPointerCancel={() => { cropDragRef.current = null; }}
+              onTouchStart={(e) => {
+                if (e.touches.length === 2) {
+                  const dx = e.touches[0].clientX - e.touches[1].clientX;
+                  const dy = e.touches[0].clientY - e.touches[1].clientY;
+                  cropPinchRef.current = { d0: Math.hypot(dx, dy) || 1, z0: cropZoom };
+                }
+              }}
+              onTouchMove={(e) => {
+                const pinch = cropPinchRef.current;
+                if (!pinch || e.touches.length !== 2) return;
+                const dx = e.touches[0].clientX - e.touches[1].clientX;
+                const dy = e.touches[0].clientY - e.touches[1].clientY;
+                const z = Math.max(1, Math.min(5, pinch.z0 * (Math.hypot(dx, dy) / pinch.d0)));
+                setCropZoom(z);
+                setCropOff((o) => cropClampOff(o, z));
+              }}
+              onTouchEnd={() => { cropPinchRef.current = null; }}
+            >
+              <img
+                src={cropPic.dataUrl}
+                alt=""
+                draggable={false}
+                style={{
+                  width: `${cropPic.w * cropScale}px`,
+                  maxHeight: 'none',
+                  transform: `translate(calc(-50% + ${cropOff.x}px), calc(-50% + ${cropOff.y}px))`,
+                }}
+              />
+            </div>
+            <div className="crop-zoomrow">
+              <button
+                type="button"
+                className="call-btn mute"
+                onClick={() => {
+                  const z = Math.max(1, cropZoom - 0.25);
+                  setCropZoom(z);
+                  setCropOff((o) => cropClampOff(o, z));
+                }}
+                title="Меньше"
+              >−</button>
+              <input
+                type="range"
+                min={1}
+                max={5}
+                step={0.05}
+                value={cropZoom}
+                onChange={(e) => {
+                  const z = Number(e.target.value) || 1;
+                  setCropZoom(z);
+                  setCropOff((o) => cropClampOff(o, z));
+                }}
+                aria-label="Масштаб аватара"
+              />
+              <button
+                type="button"
+                className="call-btn mute"
+                onClick={() => {
+                  const z = Math.min(5, cropZoom + 0.25);
+                  setCropZoom(z);
+                  setCropOff((o) => cropClampOff(o, z));
+                }}
+                title="Больше"
+              >＋</button>
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="settings-cancel" onClick={closeCrop}>ОТМЕНА</button>
+              <button type="button" className="settings-save" onClick={submitCrop}>ОБРЕЗАТЬ И ВЫБРАТЬ</button>
+            </div>
+          </div>
+        </div>
       )}
 
       {composeOpen && (

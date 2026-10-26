@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS users (
     bio TEXT NOT NULL DEFAULT '',
     status_text TEXT NOT NULL DEFAULT '',
     status_emoji TEXT NOT NULL DEFAULT '',
+    -- v1.0.3 привативность: 0 = скрыт из поиска людей.
+    searchable INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

@@ -13,6 +13,8 @@ export interface User {
   statusEmoji?: string;
   isAdmin?: number;
   banned?: number;
+  // Тумблер приватности: 0 = меня не находят через поиск people.
+  searchable?: number;
 }
 
 // PBKDF2-SHA256, 25 000 итераций — бесплатно по CPU и достаточно против оффлайн-брута.
@@ -118,15 +120,30 @@ export async function userByToken(env: Env, token: string): Promise<User | null>
 
 // Полный профиль из users (для /api/me/profile и публичных страниц).
 export async function profileOf(env: Env, id: number): Promise<User | null> {
-  const row = await env.DB.prepare(
-    'SELECT id, username, avatar, is_admin, banned, display_name, bio, status_text, status_emoji FROM users WHERE id = ? LIMIT 1',
-  ).bind(id).first<any>();
+  // Колонка searchable появляется миграцией; до неё D1 кидает «no such column»
+  // — работаем по-старому (всех видно), а не падаем.
+  let row: any;
+  try {
+    row = await env.DB.prepare(
+      'SELECT id, username, avatar, is_admin, banned, display_name, bio, status_text, status_emoji, searchable FROM users WHERE id = ? LIMIT 1',
+    ).bind(id).first<any>();
+  } catch (e: any) {
+    if (String(e?.message || e).includes('no such column')) {
+      row = await env.DB.prepare(
+        'SELECT id, username, avatar, is_admin, banned, display_name, bio, status_text, status_emoji FROM users WHERE id = ? LIMIT 1',
+      ).bind(id).first<any>();
+      if (row) row.searchable = 1;
+    } else {
+      throw e;
+    }
+  }
   if (!row) return null;
   return {
     id: row.id, username: row.username, avatar: row.avatar || '',
     isAdmin: row.is_admin || 0, banned: row.banned || 0,
     displayName: row.display_name || '', bio: row.bio || '',
     statusText: row.status_text || '', statusEmoji: row.status_emoji || '',
+    searchable: row.searchable ?? 1,
   };
 }
 

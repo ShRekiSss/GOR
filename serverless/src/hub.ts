@@ -130,7 +130,9 @@ export class Hub {
       // Адресат не в сети — сообщим вызывающему.
       if (!delivered) {
         this.sendTo(conID, s, { type: 'call_offline', fromName: s.username, toName: to });
-        if (data.type === 'call_invite') {
+        // Пуш на входящий: раньше сработал только на call_invite, а клиент
+        // шлёт call_offer — из-за этого телефон в кармане молчал.
+        if (data.type === 'call_invite' || data.type === 'call_offer') {
           try {
             const uid = await this.env.DB.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE').bind(to).first<{ id: number }>().catch(() => null);
             if (uid?.id) {
