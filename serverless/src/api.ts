@@ -155,6 +155,7 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
     return adminApi(req, env, user);
   }
 
+  // ---------- Профиль (MVP по WeChat-спеке) ----------
   // Свой профиль: полный, со счётчиками разделов.
   if (path === '/api/me/profile' && req.method === 'GET') {
     const me = await profileOf(env, user.id);
@@ -188,6 +189,22 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
       'UPDATE users SET display_name = ?, bio = ?, status_text = ?, status_emoji = ? WHERE id = ?',
     ).bind(dn, bio, st, se, user.id).run();
     return json({ user: await profileOf(env, user.id) });
+  }
+
+  // Друзья первого этапа: все, с кем есть личный чат.
+  if (path === '/api/me/friends' && req.method === 'GET') {
+    const rows = await env.DB.prepare(
+      `SELECT DISTINCT u.id, u.username, u.avatar, u.status_text, u.status_emoji
+       FROM chat_members a
+       JOIN chats c ON c.id = a.chat_id AND c.type = 'direct'
+       JOIN chat_members m ON m.chat_id = c.id AND m.user_id != a.user_id
+       JOIN users u ON u.id = m.user_id
+       WHERE a.user_id = ? ORDER BY u.username LIMIT 100`,
+    ).bind(user.id).all<any>();
+    return json({ friends: (rows.results || []).map((f) => ({
+      id: f.id, username: f.username, avatar: f.avatar || '',
+      statusText: f.status_text || '', statusEmoji: f.status_emoji || '',
+    })) });
   }
 
   // Публичный профиль по @username: только безопасная часть.

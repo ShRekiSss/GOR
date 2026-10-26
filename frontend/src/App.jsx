@@ -131,6 +131,16 @@ function App() {
   const [groupMembers, setGroupMembers] = useState([]);
   const [chatError, setChatError] = useState('');
   const [autostart, setAutostart] = useState(false);
+  // Панель разраба (для админов): лист юзеров, бан/разбан, переминовка.
+  const [adminPanel, setAdminPanel] = useState(false);
+  const [adminUsers, setAdminUsers] = useState([]);
+  const [adminBusy, setAdminBusy] = useState(false);
+  // Профиль WeChat-стиля: свой (редактируемый) или чужой (публичная карточка).
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [profileData, setProfileData] = useState(null);
+  const [profileCounts, setProfileCounts] = useState(null);
+  const [profileFriends, setProfileFriends] = useState(null);
+  const [profileDraft, setProfileDraft] = useState(null);
   // Web Push: поддержан ли браузером и включён ли (для тумблера в настройках).
   const [pushInfo, setPushInfo] = useState({ supported: false, on: false, busy: false });
 
@@ -638,6 +648,18 @@ function App() {
     }
     loadChats();
   }, [user, loadChats]);
+
+  // Публичная страница /u/:username — открыть чужой профиль до входа в чат.
+  useEffect(() => {
+    if (!user) return undefined;
+    const m = /\/u\/([\w.-]{3,32})/.exec(window.location.pathname);
+    if (!m) return undefined;
+    const name = m[1];
+    // Демо-стенами к плейсу: смотрим профиль, чистим адрес, не роняя историю.
+    window.history.replaceState(null, '', '/');
+    openUserProfile(name);
+    return undefined;
+  }, [user]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     chatsRef.current = chats;
@@ -1429,6 +1451,134 @@ function App() {
     } catch (error) {
       console.error('autostart toggle:', error);
     }
+  };
+
+  // ---------- Профиль WeChat-стиля ----------
+  const fmtTsLocal = (ts) => {
+    if (!ts) return '—';
+    const s = String(ts).includes('-')
+      ? new Date(`${String(ts).replace(' ', 'T')}Z`)
+      : new Date(Number(ts) * 1000);
+    return Number.isNaN(s.getTime()) ? '—' : s.toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+  };
+
+  const openMyProfile = async () => {
+    setProfileOpen(true);
+    setProfileData(null);
+    setProfileCounts(null);
+    setProfileFriends(null);
+    setProfileDraft(null);
+    try {
+      const r = await authFetch('/api/me/profile');
+      if (r.ok) {
+        const d = await r.json();
+        setProfileData({ ...d.user, mine: true });
+        setProfileCounts(d.counts || null);
+      }
+      const f = await authFetch('/api/me/friends');
+      if (f.ok) setProfileFriends((await f.json()).friends || []);
+    } catch { /* сеть дрогнула — пустая карточка */ }
+  };
+
+  const openUserProfile = async (username) => {
+    setProfileOpen(true);
+    setProfileData(null);
+    setProfileCounts(null);
+    setProfileFriends(null);
+    setProfileDraft(null);
+    try {
+      const r = await authFetch(`/api/users/${encodeURIComponent(username)}/profile`);
+      if (!r.ok) {
+        showToast('Профиль не найден');
+        setProfileOpen(false);
+        return;
+      }
+      const d = await r.json();
+      setProfileData((prev) => ({ ...d.user, mine: d.user.username === username }));
+    } catch {
+      showToast('Профиль не загрузился');
+    }
+  };
+
+  const saveProfile = async () => {
+    if (!profileDraft) return;
+    try {
+      const r = await authFetch('/api/me/profile', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(profileDraft),
+      });
+      const t = await r.text();
+      if (!r.ok) {
+        showToast(t.trim() || 'Не сохранилось');
+        return;
+      }
+      const d = JSON.parse(t);
+      setProfileData({ ...d.user, mine: true });
+      setProfileDraft(null);
+      showToast('Профиль сохранён');
+    } catch {
+      showToast('Профиль не сохранился — сеть дрогнула');
+    }
+  };
+
+  const shareProfileLink = async (username) => {
+    const link = `${window.location.origin}/u/${username}`;
+    try {
+      await navigator.clipboard.writeText(link);
+      showToast('Ссылка скопирована');
+    } catch {
+      showToast(link);
+    }
+  };
+
+  // ---------- Панель разраба (только админ) ----------
+  const loadAdminUsers = async () => {
+    setAdminBusy(true);
+    try {
+      const r = await authFetch('/api/admin/users');
+      const t = await r.text();
+      if (!r.ok) { showToast(t.trim() || 'Не вышло'); setAdminPanel(false); return; }
+      setAdminUsers(JSON.parse(t).users || []);
+    } catch { showToast('Лист юзеров не загрузился'); } finally { setAdminBusy(false); }
+  };
+
+  const openAdmin = async () => {
+    setAdminPanel(true);
+    await loadAdminUsers();
+  };
+
+  const adminBan = async (id, on) => {
+    if (!on && window.confirm === undefined) { /* всегда доступен */ }
+    setAdminBusy(true);
+    try {
+      const r = await authFetch(`/api/admin/users/${id}/ban`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ on }),
+      });
+      const t = await r.text();
+      if (!r.ok) { showToast(t.trim() || 'Не вышло'); return; }
+      showToast(on ? 'Забанен' : 'Разбанен');
+      await loadAdminUsers();
+    } catch { showToast('Бан не прошёл — сеть дрогнула'); } finally { setAdminBusy(false); }
+  };
+
+  const adminRename = async (id, cur) => {
+    const name = window.prompt('Новый ник (латиница/цифры/_.- 3-32):', cur || '');
+    if (!name || name.trim() === cur) return;
+    setAdminBusy(true);
+    try {
+      const r = await authFetch(`/api/admin/users/${id}/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: name.trim() }),
+      });
+      const t = await r.text();
+      if (!r.ok) { showToast(t.trim() || 'Не вышло'); return; }
+      showToast('Переименован');
+      await loadAdminUsers();
+    } catch { showToast('Переименование не прошло — сеть дрогнула'); } finally { setAdminBusy(false); }
   };
 
   // Вкл/выкл Web Push: подписка в SW + учётная запись на сервере.
@@ -2699,6 +2849,25 @@ function App() {
             <div className="settings-actions">
               <button
                 type="button"
+                className="settings-admin-btn"
+                onClick={openMyProfile}
+              >
+                👤 Мой профиль
+              </button>
+              {user?.isAdmin && (
+                <button
+                  type="button"
+                  className="settings-admin-btn"
+                  onClick={openAdmin}
+                >
+                  🛠 Панель разраба
+                </button>
+              )}
+            </div>
+
+            <div className="settings-actions">
+              <button
+                type="button"
                 className="settings-cancel"
                 onClick={closeSettings}
               >
@@ -2707,6 +2876,224 @@ function App() {
               <button type="submit" className="settings-save">СОХРАНИТЬ</button>
             </div>
           </form>
+        </div>
+      )}
+
+      {adminPanel && (
+        <div className="settings-overlay" onClick={() => setAdminPanel(false)}>
+          <div
+            className="settings-card admin-card"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2>Панель разраба</h2>
+            <div className="admin-list">
+              {adminUsers.map((u) => (
+                <div key={u.id} className={`admin-row ${u.banned ? 'banned' : ''}`}>
+                  <div className="admin-main">
+                    <div className="admin-name">
+                      {u.displayName || u.username}
+                      {u.isAdmin ? ' 🛠' : ''}{u.banned ? ' ⛔ забанен' : ''}
+                    </div>
+                    <div className="admin-sub">
+                      @{u.username} · входов: {u.sessions_alive || 0} · последний вход: {fmtTsLocal(u.last_login)} · последнее сообщение: {fmtTsLocal(u.last_message)}
+                    </div>
+                  </div>
+                  <div className="admin-actions">
+                    <button type="button" onClick={() => adminRename(u.id, u.username)}>переименовать</button>
+                    <button
+                      type="button"
+                      className={u.banned ? 'ok' : 'danger'}
+                      onClick={() => adminBan(u.id, !u.banned)}
+                    >
+                      {u.banned ? 'разбанить' : 'бан'}
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {adminUsers.length === 0 && (
+                <div className="admin-empty">{adminBusy ? 'Загрузка…' : 'Пусто'}</div>
+              )}
+            </div>
+            <div className="settings-actions">
+              <button type="button" className="settings-cancel" onClick={() => setAdminPanel(false)}>
+                ЗАКРЫТЬ
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {profileOpen && (
+        <div className="settings-overlay" onClick={() => setProfileOpen(false)}>
+          <div
+            className="settings-card profile-card"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="profile-head">
+              <h2>Профиль</h2>
+              <div className="profile-share">
+                {profileData && (
+                  <button type="button" onClick={() => shareProfileLink(profileData.username)}>
+                    🔗 копировать ссылку
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {!profileData && (
+              <div className="profile-loading">Загрузка…</div>
+            )}
+
+            {profileData && (
+              <>
+                <div className="profile-hero">
+                  <span className="profile-avatar">
+                    {profileData.avatar
+                      ? <img src={resolveUrl(profileData.avatar)} alt="аватар" />
+                      : (profileData.displayName || profileData.username || '?').charAt(0).toUpperCase()}
+                  </span>
+                  <div className="profile-identity">
+                    <div className="profile-name">
+                      {profileData.displayName || profileData.username}
+                      {profileData.isAdmin ? <span className="profile-badge">🛠 разраб</span> : null}
+                    </div>
+                    <div className="profile-username">@{profileData.username}</div>
+                    {(profileData.statusEmoji || profileData.statusText) && (
+                      <div className="profile-status">
+                        {profileData.statusEmoji || '🟢'} {profileData.statusText}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {profileData.bio && (
+                  <div className="profile-bio">{profileData.bio}</div>
+                )}
+
+                {profileData.mine && (
+                  <div className="profile-edit-block">
+                    {!profileDraft && (
+                      <button
+                        type="button"
+                        className="profile-edit-btn"
+                        onClick={() => setProfileDraft({
+                          displayName: profileData.displayName || '',
+                          bio: profileData.bio || '',
+                          statusEmoji: profileData.statusEmoji || '',
+                          statusText: profileData.statusText || '',
+                        })}
+                      >
+                        ✎ Редактировать профиль
+                      </button>
+                    )}
+                    {profileDraft && (
+                      <div className="profile-form">
+                        <input
+                          className="setup-input"
+                          placeholder="Отображаемое имя"
+                          value={profileDraft.displayName}
+                          maxLength={48}
+                          onChange={(e) => setProfileDraft({ ...profileDraft, displayName: e.target.value })}
+                        />
+                        <input
+                          className="setup-input"
+                          placeholder="Статус: эмодзи (🟢 💻 ⛔ …)"
+                          value={profileDraft.statusEmoji}
+                          maxLength={8}
+                          onChange={(e) => setProfileDraft({ ...profileDraft, statusEmoji: e.target.value })}
+                        />
+                        <input
+                          className="setup-input"
+                          placeholder="Статус: текст"
+                          value={profileDraft.statusText}
+                          maxLength={64}
+                          onChange={(e) => setProfileDraft({ ...profileDraft, statusText: e.target.value })}
+                        />
+                        <textarea
+                          className="setup-input profile-bio-input"
+                          placeholder="О себе (до 280)"
+                          value={profileDraft.bio}
+                          maxLength={280}
+                          rows={3}
+                          onChange={(e) => setProfileDraft({ ...profileDraft, bio: e.target.value })}
+                        />
+                        <button type="button" className="profile-save-btn" onClick={saveProfile}>
+                          СОХРАНИТЬ
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {profileData.mine && (
+                  <div className="profile-sections">
+                    <div className="profile-row" onClick={() => {
+                      setProfileFriends(null);
+                      authFetch('/api/me/friends').then(async (f) => {
+                        if (f.ok) setProfileFriends((await f.json()).friends || []);
+                      }).catch(() => {});
+                    }}>
+                      👥 Друзья <span className="profile-count">{profileCounts?.friends ?? profileFriends?.length ?? 0}</span>
+                    </div>
+                    {profileFriends && profileFriends.length > 0 && (
+                      <div className="profile-friends">
+                        {profileFriends.map((f) => (
+                          <div
+                            key={f.id}
+                            className="profile-friend"
+                            onClick={() => openUserProfile(f.username)}
+                          >
+                            <span className="profile-friend-avatar">
+                              {f.avatar
+                                ? <img src={resolveUrl(f.avatar)} alt="" />
+                                : (f.username?.[0] || '?').toUpperCase()}
+                            </span>
+                            <span className="profile-friend-name">
+                              {f.username}
+                              {f.statusEmoji ? ` ${f.statusEmoji}` : ''}
+                            </span>
+                            <span className="profile-friend-arrow">›</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <div className="profile-row muted">🖼 Фотографии <span className="profile-count">{profileCounts?.photos ?? 0}</span></div>
+                    <div className="profile-row muted">✨ Заметки <span className="profile-count">{profileCounts?.notes ?? 0}</span></div>
+                    <div className="profile-row muted">🔗 Ссылки <span className="profile-count">{profileCounts?.links ?? 0}</span></div>
+                  </div>
+                )}
+
+                {!profileData.mine && (
+                  <div className="profile-action-bar">
+                    <button
+                      type="button"
+                      className="profile-primary-action"
+                      onClick={() => {
+                        setProfileOpen(false);
+                        createDirect(profileData.username);
+                      }}
+                    >
+                      💬 Написать
+                    </button>
+                    <button
+                      type="button"
+                      className="profile-primary-action secondary"
+                      onClick={() => {
+                        if (callEngineRef.current?.pc) {
+                          showToast('Уже в звонке');
+                          return;
+                        }
+                        setProfileOpen(false);
+                        callEngineRef.current?.start(profileData.username);
+                      }}
+                    >
+                      📞 Позвонить
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
         </div>
       )}
 
