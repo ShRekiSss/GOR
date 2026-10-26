@@ -1512,12 +1512,6 @@ function App() {
     }
   };
 
-  // Парсер «Голосовое · N с» → секунды (для кружка до загрузки волны).
-  const voiceSecs = (msg) => {
-    const m = String(msg.text || '').match(/(\d+)\s*с/);
-    return m ? Number(m[1]) : 0;
-  };
-
   // ---------- v1.0.4: нейро-бот ----------
   const sendAiMessage = async () => {
     if (!inputValue.trim()) {
