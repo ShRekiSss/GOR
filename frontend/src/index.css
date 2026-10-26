@@ -1,0 +1,32 @@
+body {
+  margin: 0;
+  font-family: 'Roboto', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+  font-family: 'Roboto Mono', source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+
+/* ---------- Темы v1.0.3 ---------- */
+/* Светлая: инверсия всего интерфейса (dark→light) с обратной инверсией
+   картинок/медиа, чтобы фото и аватарки оставались натуральными. */
+html[data-theme="light"] {
+  filter: invert(0.92) hue-rotate(180deg) contrast(0.96);
+  background: #e8edf2;
+}
+html[data-theme="light"] img,
+html[data-theme="light"] video,
+html[data-theme="light"] .sticker-preview,
+html[data-theme="light"] audio {
+  filter: invert(1) hue-rotate(180deg);
+}
+/* Своя тема: `.app-shell` и переменные рисует пользовательский CSS
+   (подключается отдельным <style data-vaksa-custom>) — здесь дефолтных
+   переопределений нет, чтобы файл темы был независим. */
+
+

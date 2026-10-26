@@ -1,0 +1,346 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npm run build
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build server (linux/amd64)
+        run: |
+          mkdir -p dist/gor-linux-amd64
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags "-s -w -X main.version=${{ github.ref_name }}" \
+            -o dist/gor-linux-amd64/gor .
+          # Кладём статику как frontend/build — так ищет сервер по умолчанию
+          # (GOR_STATIC=./frontend/build) и как написано в README: скачал — запустил.
+          mkdir -p dist/gor-linux-amd64/frontend
+          cp -r frontend/build dist/gor-linux-amd64/frontend/build
+          cp README.md dist/gor-linux-amd64/
+          tar -C dist -czf gor-linux-amd64.tar.gz gor-linux-amd64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gor-linux-amd64
+          path: gor-linux-amd64.tar.gz
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        shell: bash
+        run: |
+          npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npm run build
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build server (windows/amd64)
+        shell: bash
+        run: |
+          mkdir -p dist/gor-windows-amd64
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath \
+            -ldflags "-s -w -X main.version=${{ github.ref_name }}" \
+            -o dist/gor-windows-amd64/gor.exe .
+          mkdir -p dist/gor-windows-amd64/frontend
+          cp -r frontend/build dist/gor-windows-amd64/frontend/build
+          cp README.md dist/gor-windows-amd64/
+          cd dist && powershell Compress-Archive -Path gor-windows-amd64 -DestinationPath ../gor-windows-amd64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gor-windows-amd64
+          path: gor-windows-amd64.zip
+
+  desktop-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            desktop/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        shell: bash
+        run: |
+          npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Build desktop app (NSIS + MSI)
+        working-directory: desktop
+        shell: bash
+        run: |
+          npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npx tauri build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gor-desktop-windows
+          path: |
+            desktop/src-tauri/target/release/gor-desktop.exe
+            desktop/src-tauri/target/release/bundle/nsis/*.exe
+            desktop/src-tauri/target/release/bundle/msi/*.msi
+
+  desktop-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            desktop/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Build desktop app (AppImage + deb)
+        working-directory: desktop
+        run: |
+          npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npx tauri build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gor-desktop-linux
+          path: |
+            desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+            desktop/src-tauri/target/release/bundle/deb/*.deb
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # sdkmanager: используем предустановленный на ubuntu-latest SDK,
+      # android-actions/setup-android@v3 падает (sdkmanager tools → exit 1).
+      - name: Install Android NDK
+        run: |
+          set -e
+          SDK="$ANDROID_HOME"
+          echo "SDK root: $SDK"
+          sudo "$SDK/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;27.0.12077973" >/dev/null
+          yes | sudo "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          echo "NDK_HOME=$SDK/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$SDK/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust targets for Android
+        run: rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npm run build
+
+      - name: Build APK (universal, 4 ABI)
+        working-directory: desktop
+        run: |
+          npm install -g npm@11 >/dev/null 2>&1; npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          # gradle/AGP пишет служебные директории в пользовательский ".android".
+          # ВАЖНО: ANDROID_USER_HOME — это сам каталог ".android", а ANDROID_SDK_HOME —
+          # его РОДИТЕЛЬ. Совпадение значений роняет AGP: "Could not create provider
+          # for value source AndroidLocationsBuildService.AndroidDirectoryCreator".
+          export ANDROID_USER_HOME="$RUNNER_TEMP/android-user-home/.android"
+          export ANDROID_SDK_HOME="$RUNNER_TEMP/android-user-home"
+          sudo mkdir -p "$HOME/.config/.android" "$ANDROID_HOME/.android"
+          sudo chmod -R a+rwX "$HOME/.config/.android" "$ANDROID_HOME/.android" "$HOME/.config" 2>/dev/null || true
+          sudo chown -R "$(id -un):$(id -gn)" "$HOME/.config/.android" "$ANDROID_HOME/.android" 2>/dev/null || true
+          npx tauri android init --ci
+          bash patch-android-permissions.sh
+          # ValueSource AndroidDirectoryCreator падает под configuration cache — отключаем.
+          printf '\norg.gradle.configuration-cache=false\n' >> src-tauri/gen/android/gradle.properties
+          # ГЛАВНЫЙ ФИКС: `tauri android build` запускает gradle с отфильтрованным
+          # окружением (белый список: PATH, HOME, CARGO_*, ANDROID_HOME, NDK_HOME...),
+          # из-за чего ANDROID_USER_HOME не доходит до gradle и AGP падает на
+          # AndroidLocationsBuildService (~/.config/.android на раннере root-owned).
+          # Оборачиваем gradlew: восстанавливаем вырезанные переменные перед exec.
+          mv src-tauri/gen/android/gradlew src-tauri/gen/android/gradlew.bin
+          cat > src-tauri/gen/android/gradlew <<'WRAP'
+          #!/bin/sh
+          # ci: tauri CLI отфильтровал окружение — восстанавливаем для AGP
+          export ANDROID_USER_HOME="${ANDROID_USER_HOME:-/tmp/android-user-home}"
+          export ANDROID_SDK_HOME="${ANDROID_SDK_HOME:-/tmp/android-user-home}"
+          mkdir -p "$ANDROID_USER_HOME" 2>/dev/null || true
+          exec "$(dirname "$0")/gradlew.bin" "$@"
+          WRAP
+          chmod +x src-tauri/gen/android/gradlew
+          head -7 src-tauri/gen/android/gradlew
+          grep -q "ANDROID_USER_HOME" src-tauri/gen/android/gradlew || (echo "::error::gradlew не создан"; exit 1)
+          # Если секреты подписи заданы — релизная подпись; иначе debug-APK (ставится на любую телефон)
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > src-tauri/release.jks
+            export TAURI_ANDROID_KEYSTORE_PATH=$PWD/src-tauri/release.jks
+            export TAURI_ANDROID_KEYSTORE_PASSWORD="${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
+            export TAURI_ANDROID_KEY_ALIAS="${{ secrets.ANDROID_KEY_ALIAS }}"
+            export TAURI_ANDROID_KEY_PASSWORD="${{ secrets.ANDROID_KEY_PASSWORD }}"
+            npx tauri android build --ci --apk
+          else
+            npx tauri android build --ci --apk --debug
+          fi
+
+      - name: Sign unsigned APK (иначе Android не разрешит установку)
+        working-directory: desktop/src-tauri/gen/android
+        run: |
+          set -e
+          BT="$ANDROID_HOME/build-tools/34.0.0"
+          APK=$(find app/build/outputs/apk -name '*.apk' ! -name '*-idlib*' | head -1)
+          if [ -z "$APK" ]; then echo "::error::APK не найден"; exit 1; fi
+          echo "Найден APK: $APK"
+          case "$APK" in
+            *release-unsigned*)
+              :
+              ;;
+            *)
+              echo "APK уже подписан — пропускаем"
+              exit 0
+              ;;
+          esac
+          KS=/tmp/release-keystore.jks
+          # Настоящий ключ релиза (секрет ANDROID_KEYSTORE_BASE64) — чтобы новый APK
+          # ставился ПОВЕРХ старого (та же подпись, alias gor). Если секрета нет —
+          # ephemeral-ключ только для тестовых сборок.
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$KS"
+            KS_PASS="pass:gor_release_2026"
+            KS_ALIAS="gor"
+          else
+            keytool -genkeypair -v -keystore "$KS" -storepass vaksa-ci -keypass vaksa-ci \
+              -alias vaksa -keyalg RSA -keysize 2048 -validity 10950 \
+              -dname "CN=VAKSA, OU=GOR, O=VAKSA, C=RU" >/dev/null 2>&1
+            KS_PASS="pass:vaksa-ci"
+            KS_ALIAS="vaksa"
+          fi
+          "$BT/zipalign" -f 4 "$APK" "$APK.aligned"
+          "$BT/apksigner" sign --ks "$KS" --ks-pass "$KS_PASS" --ks-key-alias "$KS_ALIAS" --key-pass "$KS_PASS" \
+            --out "$APK" "$APK.aligned" 2>&1
+          "$BT/apksigner" verify "$APK"
+          # Готовый файл кладём туда, где его ждёт upload-artifact (universal/**).
+          mv "$APK" "app/build/outputs/apk/universal/VAKSA-universal.apk"
+          rm -f "$APK.aligned"
+          find app/build/outputs/apk -type f -name '*.apk' | head -10
+          echo "Готово: VAKSA-universal.apk (подписан релизным ключом)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gor-android-apk
+          path: |
+            desktop/src-tauri/gen/android/app/build/outputs/apk/universal/**/*.apk
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows, desktop-windows, desktop-linux, android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect APK
+        run: |
+          mkdir -p artifacts/apk
+          # Терпимый шаг: отсутствие артефакта не должно валить релиз (warning ниже).
+          find artifacts/gor-android-apk -type f -name '*.apk' -exec cp {} artifacts/apk/ \; 2>/dev/null || true
+          if [ -z "$(find artifacts/apk -name '*.apk' -print -quit 2>/dev/null)" ]; then
+            echo "::warning::APK-артефакт не найден — релиз выйдет без APK"
+          fi
+          ls -la artifacts/apk
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/gor-linux-amd64/gor-linux-amd64.tar.gz
+            artifacts/gor-windows-amd64/gor-windows-amd64.zip
+            artifacts/gor-desktop-windows/**/*.exe
+            artifacts/gor-desktop-windows/**/*.msi
+            artifacts/gor-desktop-linux/**/*.AppImage
+            artifacts/gor-desktop-linux/**/*.deb
+            artifacts/apk/*.apk
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, '-') }}

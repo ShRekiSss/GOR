@@ -1,0 +1,16 @@
+{
+  "name": "gor-desktop",
+  "version": "1.0.4",
+  "private": true,
+  "description": "GOR messenger — desktop client (Tauri 2)",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "build:linux": "tauri build --no-bundle",
+    "build:windows": "tauri build --target x86_64-pc-windows-msvc --runner cargo-xwin --no-bundle"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

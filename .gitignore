@@ -1,0 +1,33 @@
+# зависимости фронтенда
+node_modules/
+frontend/node_modules/
+frontend/build/
+
+# артефакты сборки
+dist/
+*.exe
+*.zip
+*.tar.gz
+
+# данные рантайма (не должны попадать в git!)
+chat.db
+chat.db-*
+*.db
+*.db-shm
+*.db-wal
+uploads/
+data/
+
+# окружение и редакторы
+.env
+.env.local
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# desktop (Tauri)
+desktop/node_modules/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+build/

@@ -1,0 +1,7 @@
+[Unit]
+Description=VAKSA (GOR) database backup
+After=gor.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gor-backup.sh

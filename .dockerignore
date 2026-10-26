@@ -1,0 +1,16 @@
+.git
+.github
+node_modules
+frontend/node_modules
+frontend/build
+dist
+deploy/data
+chat.db
+chat.db-*
+*.db
+*.db-shm
+*.db-wal
+uploads
+*.zip
+*.tar.gz
+*.exe
