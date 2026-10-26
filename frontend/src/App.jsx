@@ -2644,6 +2644,17 @@ function App() {
               Сменить сервер: {server}
             </button>
           )}
+          {/* Зеркало (не vaksa.space): API маленький, а сайт-по-умолчанию —
+              другой origin; без этих кнопок зеркальные гости не подключатся. */}
+          {!isDesktop() && (
+            <button
+              type="button"
+              className="auth-switch auth-serverlink"
+              onClick={() => setShowServerSetup(true)}
+            >
+              Сменить сервер: vaksa.space
+            </button>
+          )}
         </form>
       </div>
     );
