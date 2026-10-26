@@ -531,16 +531,20 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
     return json({ ok: true, id: res.meta.last_row_id }, 201);
   }
 
-  if (seg[0] === 'api' && seg[1] === 'stories' && seg.length === 3) {
+  if (seg[0] === 'api' && seg[1] === 'stories' && seg.length >= 3) {
     const sid = Number(seg[2]);
     if (!Number.isInteger(sid) || sid <= 0) return text('Не найдено', 404);
-    if (req.method === 'POST') {
-      // Отметка просмотра: кто бы ни был — инкремент один раз.
+    // /api/stories/:id          — DELETE (свой)
+    // /api/stories/:id/view     — POST (отметка просмотра)
+    const sub = seg[3] || '';
+    if (sub && sub !== 'view') return text('Не найдено', 404);
+    if (req.method === 'POST' && (!sub || sub === 'view')) {
+      // Отметка просмотра: один пользователь = один инкремент.
       await env.DB.prepare('INSERT OR IGNORE INTO story_views (story_id, user_id) VALUES (?, ?)')
         .bind(sid, user.id).run();
       return new Response(null, { status: 204 });
     }
-    if (req.method === 'DELETE') {
+    if (req.method === 'DELETE' && !sub) {
       const own = await env.DB.prepare(
         'SELECT id, file_key AS fileKey FROM stories WHERE id = ? AND user_id = ?',
       ).bind(sid, user.id).first<any>();
