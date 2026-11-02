@@ -2551,8 +2551,19 @@ input {
   border: 1px solid rgba(71, 194, 106, 0.5);
   color: #57e389;
   font-variant-numeric: tabular-nums;
-  cursor: pointer;
+  cursor: default;
+  pointer-events: none; /* палец на кнопке: подсказка только показывает */
   user-select: none;
+  white-space: nowrap;
+}
+.voice-live.cancel {
+  background: rgba(224, 87, 74, 0.16);
+  border-color: rgba(224, 87, 74, 0.6);
+  color: #ff8a80;
+}
+.voice-hint {
+  font-size: 11px;
+  opacity: 0.8;
 }
 .voice-dot {
   width: 10px;
@@ -2582,6 +2593,14 @@ input {
   cursor: pointer;
   font-size: 18px;
 }
+/* Удержание микрофона: не скроллим и не выделяем текст пальцем. */
+.voice-button {
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+.voice-button.recording { color: #e0574a; animation: recPulse 1s ease infinite; }
 .voice-button:hover, .ai-button:hover { filter: brightness(1.2); }
 
 /* Кружочек голосового (ТГ) */

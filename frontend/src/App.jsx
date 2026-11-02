@@ -1000,6 +1000,39 @@ function App() {
       return;
     }
 
+    // Чат с ботом: вопрос уходит в /api/ai (сервер сохранит вопрос и ответ).
+    if (activeChat?.isBot) {
+      const text = inputValue.trim();
+      setInputValue('');
+      setReplyTo(null);
+      if (activeChatId) {
+        try { localStorage.removeItem(`draft-${activeChatId}`); } catch { /* ок */ }
+      }
+      (async () => {
+        setTypingUser('VAKSA-бот');
+        try {
+          const r = await authFetch('/api/ai', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chatId: activeChatId, text }),
+          });
+          if (!r.ok) {
+            if (r.status === 503) throw new Error('VAKSA-бот отключён на сервере');
+            const raw = await r.text();
+            let msg = 'Бот не отвечает';
+            try { msg = JSON.parse(raw).error || msg; } catch { if (raw.trim()) msg = raw.trim(); }
+            throw new Error(msg);
+          }
+        } catch (err) {
+          setInputValue(text); // не теряем набранный вопрос при ошибке
+          showToast(`${err.message}`);
+        } finally {
+          setTypingUser('');
+        }
+      })();
+      return;
+    }
+
     const message = {
       chatId: activeChatId,
       username: username,
@@ -1433,13 +1466,19 @@ function App() {
 
   // ---------- v1.0.4: голосовые «кружочки» (ТГ-стиль) ----------
   const VOICE_MAX = 120; // сек
+  const voicePressedRef = useRef(false);   // палец/кнопка мыши сейчас удерживается
+  const voiceStartYRef = useRef(0);        // для «сдвинь вверх — отмена»
+  const voiceCancelRef = useRef(false);    // что делать в onstop
 
-  const toggleVoice = async () => {
-    // Работает только в чате; «тап старт → тап стоп».
-    if (voiceRef.current) {
-      try { voiceRef.current.rec.stop(); } catch { /* сами */ }
-      return;
-    }
+  const finishVoice = (cancel) => {
+    const v = voiceRef.current;
+    if (!v) return;
+    voiceCancelRef.current = !!cancel;
+    try { v.rec.stop(); } catch { /* уже */ }
+  };
+
+  const startVoice = async () => {
+    if (voiceRef.current) return;
     if (!activeChatId || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
       showToast('Сначала выбери чат');
       return;
@@ -1452,6 +1491,11 @@ function App() {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true },
       });
+      // Пока ждали разрешение на микрофон, палец уже отпустили — не пишем.
+      if (!voicePressedRef.current) {
+        try { stream.getTracks().forEach((t) => t.stop()); } catch { /* уже */ }
+        return;
+      }
       const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4']
         .find((m) => MediaRecorder.isTypeSupported?.(m)) || '';
       const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
@@ -1460,40 +1504,55 @@ function App() {
       rec.onstop = () => {
         stream.getTracks().forEach((t) => t.stop());
         clearInterval(rec._timer);
-        const secs = Math.max(1, Math.round((Date.now() - rec._t0) / 1000));
-        setVoiceRec(null);
+        const ms = Date.now() - rec._t0;
+        const secs = Math.max(1, Math.round(ms / 1000));
+        const canceled = voiceCancelRef.current;
+        voiceCancelRef.current = false;
         voiceRef.current = null;
+        setVoiceRec(null);
+        if (canceled) { showToast('Запись отменена'); return; }
+        // Как в ТГ: короткий тычок — не отправляем.
+        if (ms < 600) { showToast('Держи кнопку дольше — отпустишь, и уйдёт'); return; }
         sendVoice(new Blob(chunks, { type: rec.mimeType || 'audio/webm' }), secs);
       };
       rec._t0 = Date.now();
       rec._timer = setInterval(() => {
         const s = Math.round((Date.now() - rec._t0) / 1000);
-        setVoiceRec((v) => ({ ...v, secs: s, tooLong: s >= VOICE_MAX }));
-        // Потолок 2 минуты: не теряем запись, а останавливаем и отправляем.
-        if (s >= VOICE_MAX) {
-          clearInterval(rec._timer);
-          try { rec.stop(); } catch { /* уже */ }
-        }
+        setVoiceRec((v) => (v ? { ...v, secs: s } : v));
+        // Потолок 2 минуты: не теряем запись, а отправляем.
+        if (s >= VOICE_MAX) { clearInterval(rec._timer); try { rec.stop(); } catch { /* уже */ } }
       }, 250);
       rec.start(250);
-      voiceRef.current = { rec, stream };
-      setVoiceRec({ secs: 0, tooLong: false });
+      voiceRef.current = { rec, stream, cancelArmed: false };
+      setVoiceRec({ secs: 0, cancelArmed: false });
     } catch {
       showToast('Нет доступа к микрофону');
     }
   };
 
-  const cancelVoice = () => {
-    const v = voiceRef.current;
-    if (!v) return;
-    v.rec.onstop = null; // не отправлять — отменяем
-    try { v.rec.stop(); } catch { /* уже */ }
-    clearInterval(v.rec._timer);
-    v.rec._t0 = 0;
-    try { v.stream?.getTracks().forEach((t) => t.stop()); } catch { /* уже */ }
-    voiceRef.current = null;
-    setVoiceRec(null);
-    showToast('Запись отменена');
+  // Telegram-жест: удерживаешь — пишет, отпустил — отправил, сдвиг вверх — отмена.
+  const onVoiceDown = (e) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    e.preventDefault();
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* не критично */ }
+    voicePressedRef.current = true;
+    voiceStartYRef.current = e.clientY;
+    startVoice();
+  };
+  const onVoiceMove = (e) => {
+    if (!voiceRef.current) return;
+    const armed = (voiceStartYRef.current - e.clientY) > 60;
+    if (voiceRef.current.cancelArmed === armed) return;
+    voiceRef.current.cancelArmed = armed;
+    setVoiceRec((v) => (v ? { ...v, cancelArmed: armed } : v));
+  };
+  const onVoiceUp = () => {
+    voicePressedRef.current = false;
+    if (voiceRef.current) finishVoice(!!voiceRef.current.cancelArmed);
+  };
+  const onVoicePointerCancel = () => {
+    voicePressedRef.current = false;
+    if (voiceRef.current) finishVoice(true);
   };
 
   const sendVoice = async (blob, secs) => {
@@ -1523,35 +1582,6 @@ function App() {
       setReplyTo(null);
     } catch (e) {
       showToast(`Голосовое не ушло: ${e.message}`);
-    }
-  };
-
-  // ---------- v1.0.4: нейро-бот ----------
-  const sendAiMessage = async () => {
-    if (!inputValue.trim()) {
-      showToast('Напиши вопрос боту в поле ввода');
-      return;
-    }
-    if (!activeChatId) return;
-    const text = inputValue.trim();
-    setInputValue('');
-    try {
-      const r = await authFetch('/api/ai', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chatId: activeChatId, text }),
-      });
-      if (!r.ok) {
-        // 503 — ключ GOR_AI_KEY не задан на сервере: говорим по-человечески.
-        if (r.status === 503) throw new Error('VAKSA-бот отключён на сервере');
-        const raw = await r.text();
-        let msg = 'Бот не отвечает';
-        try { msg = JSON.parse(raw).error || msg; } catch { if (raw.trim()) msg = raw.trim(); }
-        throw new Error(msg);
-      }
-    } catch (e) {
-      setInputValue(text); // не теряем набранный вопрос при ошибке
-      showToast(`${e.message}`);
     }
   };
 
@@ -3312,39 +3342,29 @@ function App() {
           >
             🎨
           </button>
-          {/* Голосовое ТГ-кружочком: тап старт → тап стоп/отправка. */}
-          {voiceRec ? (
-            <span
-              className="voice-live"
-              onClick={toggleVoice}
-              role="button"
-              title="Тап — отправить, ✕ — отменить"
-            >
-              <span className="voice-dot" />
-              {String(Math.floor(voiceRec.secs / 60)).padStart(2, '0')}:{String(voiceRec.secs % 60).padStart(2, '0')}
-              <button type="button" className="voice-cancel" onClick={(e) => { e.stopPropagation(); cancelVoice(); }}>✕</button>
-            </span>
-          ) : (
-            <button
-              type="button"
-              onClick={toggleVoice}
-              disabled={!isConnected || !activeChatId}
-              className="voice-button"
-              title="Голосовое сообщение (кружочек)"
-            >
-              🎤
-            </button>
-          )}
-          {/* Нейро-бот: отвечает в текущий чат (нужен ключ GOR_AI_KEY на сервере). */}
+          {/* Голосовое как в ТГ: держишь — пишет, отпустил — отправил, сдвиг вверх — отмена. */}
           <button
             type="button"
-            onClick={sendAiMessage}
+            className={`voice-button ${voiceRec ? 'recording' : ''}`}
             disabled={!isConnected || !activeChatId}
-            className="ai-button"
-            title="Спросить VAKSA-бота (используя то, что в поле ввода)"
+            title="Удерживай — запись, отпусти — отправить (сдвинь вверх — отмена)"
+            onPointerDown={onVoiceDown}
+            onPointerMove={onVoiceMove}
+            onPointerUp={onVoiceUp}
+            onPointerCancel={onVoicePointerCancel}
+            onContextMenu={(e) => e.preventDefault()}
           >
-            🤖
+            🎤
           </button>
+          {voiceRec && (
+            <span className={`voice-live ${voiceRec.cancelArmed ? 'cancel' : ''}`} aria-live="polite">
+              <span className="voice-dot" />
+              {String(Math.floor(voiceRec.secs / 60)).padStart(2, '0')}:{String(voiceRec.secs % 60).padStart(2, '0')}
+              <span className="voice-hint">
+                {voiceRec.cancelArmed ? 'отпусти — отмена' : 'отпусти — отправить'}
+              </span>
+            </span>
+          )}
           <input
             ref={fileInputRef}
             type="file"
