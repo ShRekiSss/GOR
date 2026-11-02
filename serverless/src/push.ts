@@ -57,14 +57,9 @@ async function loadVapid(env: Env): Promise<VapidKeys> {
       .bind(JSON.stringify(jwk)).run().catch(() => null);
   }
   // Публичный raw 0x04||x||y — applicationServerKey для браузера.
-  const pub = await RUNTIME.importKey(
-    'jwk',
-    { crv: 'P-256', kty: 'EC', x: jwk.x, y: jwk.y },
-    { name: 'ECDSA', namedCurve: 'P-256' },
-    false,
-    ['verify'],
-  );
-  const raw = b64u(new Uint8Array(await RUNTIME.exportKey('raw', pub) as ArrayBuffer));
+  // Собираем напрямую из JWK: importKey(..., false /* не извлекаемый */, ...)
+  // потом не даёт exportKey('raw'), и роут уходил бы в 500.
+  const raw = b64u(concat(new Uint8Array([0x04]), unB64u(jwk.x), unB64u(jwk.y)));
   vapidMemo = { jwk, publicKey: raw };
   return vapidMemo;
 }
