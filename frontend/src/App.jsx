@@ -162,6 +162,16 @@ function App() {
   // ---------- v1.0.4: голосовые «кружочки» ----------
   const [voiceRec, setVoiceRec] = useState(null); // { secs }
   const voiceRef = useRef(null);                  // { rec, chunks, stream, t0, timer, mime }
+  // Микрофон не должен «гореть», если закрыли экран/вышли, не закончив запись.
+  useEffect(() => () => {
+    const v = voiceRef.current;
+    if (!v) return;
+    v.rec.onstop = null;
+    try { v.rec.stop(); } catch { /* уже */ }
+    clearInterval(v.rec._timer);
+    try { v.stream?.getTracks().forEach((t) => t.stop()); } catch { /* уже */ }
+    voiceRef.current = null;
+  }, []);
   // ---------- v1.0.4: истории (24 ч, ТГ/ТТ) ----------
   const [storiesGroups, setStoriesGroups] = useState([]); // [{userId, username, avatar, allSeen, stories[]}]
   const [storyViewer, setStoryViewer] = useState(null);   // { group, idx }
@@ -1459,7 +1469,11 @@ function App() {
       rec._timer = setInterval(() => {
         const s = Math.round((Date.now() - rec._t0) / 1000);
         setVoiceRec((v) => ({ ...v, secs: s, tooLong: s >= VOICE_MAX }));
-        if (s >= VOICE_MAX) cancelVoice(); // 2 минуты — потолок
+        // Потолок 2 минуты: не теряем запись, а останавливаем и отправляем.
+        if (s >= VOICE_MAX) {
+          clearInterval(rec._timer);
+          try { rec.stop(); } catch { /* уже */ }
+        }
       }, 250);
       rec.start(250);
       voiceRef.current = { rec, stream };
@@ -1528,10 +1542,15 @@ function App() {
         body: JSON.stringify({ chatId: activeChatId, text }),
       });
       if (!r.ok) {
-        const e = await r.json().catch(() => ({}));
-        throw new Error(e.error || (await r.text()).trim() || 'не отвечает');
+        // 503 — ключ GOR_AI_KEY не задан на сервере: говорим по-человечески.
+        if (r.status === 503) throw new Error('VAKSA-бот отключён на сервере');
+        const raw = await r.text();
+        let msg = 'Бот не отвечает';
+        try { msg = JSON.parse(raw).error || msg; } catch { if (raw.trim()) msg = raw.trim(); }
+        throw new Error(msg);
       }
     } catch (e) {
+      setInputValue(text); // не теряем набранный вопрос при ошибке
       showToast(`${e.message}`);
     }
   };
@@ -4371,9 +4390,12 @@ class VoiceBubble extends React.Component {
     }
     if (!this.audio) {
       // <audio>/XHR без заголовков: /uploads принимает ?t=<token>.
+      // resolveUrl() уже мог добавить токен — второй раз не добавляем.
       const token = getToken();
-      const sep = String(this.props.msg.fileUrl).includes('?') ? '&' : '?';
-      const playUrl = token ? `${this.props.msg.fileUrl}${sep}t=${encodeURIComponent(token)}` : this.props.msg.fileUrl;
+      const rawUrl = String(this.props.msg.fileUrl);
+      const hasTok = /[?&]t=/.test(rawUrl);
+      const sep = rawUrl.includes('?') ? '&' : '?';
+      const playUrl = (!token || hasTok) ? rawUrl : `${rawUrl}${sep}t=${encodeURIComponent(token)}`;
       this.audio = new Audio(playUrl);
       this.audio.addEventListener('timeupdate', () => {
         const d = this.audio.duration || this.state.dur || 1;

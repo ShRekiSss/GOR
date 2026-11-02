@@ -23,6 +23,13 @@ async function limitOk(_env: Env, userID: number, kind: string): Promise<boolean
 }
 import { hhmmss, saveAndBroadcast, broadcastOnly } from './hub';
 
+// «Друзья» в текущей модели — есть общий личный (direct) чат.
+// Один и тот же подзапрос: поиск людей, лента историй, доступ к story-файлам.
+const FRIEND_IDS_SQL = `SELECT other.user_id FROM chat_members me
+  JOIN chats c ON c.id = me.chat_id AND c.type = 'direct'
+  JOIN chat_members other ON other.chat_id = me.chat_id
+  WHERE me.user_id = ? AND other.user_id != me.user_id`;
+
 function json(obj: unknown, status = 200): Response {
   return new Response(JSON.stringify(obj), {
     status,
@@ -345,7 +352,7 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
       ))`;
     const base = (withPriv: string) => (
       `SELECT u.id, u.username, u.avatar FROM users u
-       WHERE u.id != ? AND u.username LIKE ? ${withPriv}
+       WHERE u.id != ? AND u.username != 'VAKSA-бот' AND u.username LIKE ? ${withPriv}
        ORDER BY u.username LIMIT 20`
     );
     try {
@@ -356,7 +363,8 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
       if (String(e?.message || e).includes('no such column')) {
         // Миграция не применена — старое поведение (всех видно).
         const rows = await env.DB.prepare(
-          'SELECT id, username, avatar FROM users WHERE id != ? AND username LIKE ? ORDER BY username LIMIT 20',
+          `SELECT id, username, avatar FROM users
+           WHERE id != ? AND username != 'VAKSA-бот' AND username LIKE ? ORDER BY username LIMIT 20`,
         ).bind(user.id, pattern).all<User & { avatar?: string }>();
         return json({ users: (rows.results || []).map((u) => ({ ...u, avatar: u.avatar || '' })) });
       }
@@ -477,8 +485,9 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
               EXISTS(SELECT 1 FROM story_views v2 WHERE v2.story_id = s.id AND v2.user_id = ?) AS seen
        FROM stories s JOIN users u ON u.id = s.user_id
        WHERE s.expires_at > ?
+         AND (s.user_id = ? OR s.user_id IN (${FRIEND_IDS_SQL}))
        ORDER BY s.created_at ASC`,
-    ).bind(user.id, new Date().toISOString()).all<any>();
+    ).bind(user.id, new Date().toISOString(), user.id, user.id).all<any>();
     // Группируем по автору: свои сверху, затем по свежести последней истории.
     const byUser = new Map<number, any>();
     for (const r of rows.results || []) {
@@ -539,7 +548,16 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
     const sub = seg[3] || '';
     if (sub && sub !== 'view') return text('Не найдено', 404);
     if (req.method === 'POST' && (!sub || sub === 'view')) {
-      // Отметка просмотра: один пользователь = один инкремент.
+      // Отметка просмотра: один пользователь = один инкремент. Смотреть можно
+      // только свою историю или историю друга (лента и так их не показывает).
+      const st = await env.DB.prepare(
+        'SELECT user_id AS userId FROM stories WHERE id = ? AND expires_at > ?',
+      ).bind(sid, new Date().toISOString()).first<{ userId: number }>();
+      if (!st) return text('История не найдена', 404);
+      const owner = Number(st.userId) || 0;
+      if (owner !== user.id && !(await isFriend(env, owner, user.id))) {
+        return text('История не найдена', 404);
+      }
       await env.DB.prepare('INSERT OR IGNORE INTO story_views (story_id, user_id) VALUES (?, ?)')
         .bind(sid, user.id).run();
       return new Response(null, { status: 204 });
@@ -595,6 +613,17 @@ export async function isMember(env: Env, chatID: number, userID: number): Promis
   const row = await env.DB.prepare(
     'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
   ).bind(chatID, userID).first();
+  return !!row;
+}
+
+// Друзья: есть ли между двумя юзерами личный чат (доступ к историям/файлам).
+export async function isFriend(env: Env, a: number, b: number): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 FROM chat_members me
+     JOIN chats c ON c.id = me.chat_id AND c.type = 'direct'
+     JOIN chat_members other ON other.chat_id = me.chat_id
+     WHERE me.user_id = ? AND other.user_id = ? LIMIT 1`,
+  ).bind(a, b).first();
   return !!row;
 }
 
@@ -942,6 +971,21 @@ async function uploadsRead(req: Request, env: Env, user: User, rawName: string):
 
   const name = rawName.replace(/\\/g, '/').split('/').pop() || '';
   if (!name || name.includes('..')) return text('Не найдено', 404);
+
+  // Файлы историй (префикс story_): доступ только автору и его друзьям,
+  // иначе любой участник общего чата мог скачать чужое story-медиа по имени.
+  const story = await env.DB.prepare(
+    'SELECT user_id AS userId FROM stories WHERE file_key = ? ORDER BY id DESC LIMIT 1',
+  ).bind(name).first<{ userId: number }>();
+  if (story) {
+    const owner = Number(story.userId) || 0;
+    if (owner !== viewer.id && !(await isFriend(env, owner, viewer.id))) {
+      return text('Нет доступа к файлу', 403);
+    }
+  } else if (name.startsWith('story_')) {
+    // История истекла/удалена — и файл больше никому не отдаём.
+    return text('Не найдено', 404);
+  }
 
   // Привязка к чату по сообщению с этим file_url.
   const linked = await env.DB.prepare(
