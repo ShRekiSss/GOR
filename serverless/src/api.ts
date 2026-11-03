@@ -404,7 +404,30 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
       } as any);
       return new Response(null, { status: 204 });
     }
+
+    // ---------- Групповое управление ----------
+    if (sub === 'members') {
+      if (req.method === 'GET') return groupInfo(env, chatID, user.id);
+      if (req.method === 'POST') return groupAddMembers(req, env, user, chatID);
+      return text('Method not allowed', 405);
+    }
+    if (sub === 'kick' && req.method === 'POST') return groupKick(req, env, user, chatID);
+    if (sub === 'leave' && req.method === 'POST') return groupLeave(env, user, chatID);
+    if (sub === 'role' && req.method === 'POST') return groupSetRole(req, env, user, chatID);
+    if (sub === 'invite') {
+      if (req.method === 'POST') return groupCreateInvite(env, user, chatID);
+      if (req.method === 'DELETE') return groupRevokeInvite(env, user, chatID);
+      if (req.method === 'GET') return groupInfo(env, chatID, user.id);
+    }
     return text('Не найдено', 404);
+  }
+
+  // ---------- Приглашение по ссылке /invite/:token ----------
+  if (seg[0] === 'api' && seg[1] === 'invite' && seg[2] && seg.length === 3) {
+    const token = String(seg[2]);
+    if (req.method === 'GET') return invitePreview(env, user, token);
+    if (req.method === 'POST') return joinInvite(env, user, token);
+    return text('Method not allowed', 405);
   }
 
   // ---------- messages (старый путь, массивом) ----------
@@ -756,14 +779,18 @@ export async function listChats(env: Env, userID: number) {
   // У каждого пользователя есть личный чат с ботом (даже если AI-ключ ещё не задан).
   await ensureBotChat(env, userID).catch(() => null);
   const rows = await env.DB.prepare(
-    `SELECT c.id, c.type, c.title, cm.last_read_message_id AS last_read
+    `SELECT c.id, c.type, c.title, cm.last_read_message_id AS last_read, cm.role AS my_role,
+            (SELECT COUNT(*) FROM chat_members x WHERE x.chat_id = c.id) AS members_count
      FROM chats c JOIN chat_members cm ON cm.chat_id = c.id
      WHERE cm.user_id = ?`,
-  ).bind(userID).all<{ id: number; type: string; title: string; last_read: number }>();
+  ).bind(userID).all<{ id: number; type: string; title: string; last_read: number; my_role: string; members_count: number }>();
 
   const items: { chat: any; lastID: number }[] = [];
   for (const r of rows.results || []) {
-    const chat: any = { id: r.id, type: r.type, title: r.title, unread: 0 };
+    const chat: any = {
+      id: r.id, type: r.type, title: r.title, unread: 0,
+      myRole: r.my_role || 'member',
+    };
     let lastID = 0;
     const last = await env.DB.prepare(
       'SELECT id, text, username, timestamp FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT 1',
@@ -778,6 +805,7 @@ export async function listChats(env: Env, userID: number) {
       'SELECT COUNT(*) AS n FROM messages WHERE chat_id = ? AND id > ? AND COALESCE(user_id, 0) != ?',
     ).bind(r.id, r.last_read, userID).first<{ n: number }>();
     chat.unread = unreadRow?.n || 0;
+    if (r.type === 'group') chat.membersCount = r.members_count || 0;
 
     if (r.type === 'direct') {
       const peer = await env.DB.prepare(
@@ -858,12 +886,12 @@ async function createChat(req: Request, env: Env, user: User): Promise<Response>
     const chatID = ins.meta.last_row_id as number;
 
     const seen = new Set<number>([user.id]);
-    let q = 'INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)';
+    let q = "INSERT INTO chat_members (chat_id, user_id, role) VALUES (?, ?, 'owner')";
     const binds: any[] = [chatID, user.id];
     for (const id of ids) {
       if (!id || seen.has(id)) continue;
       seen.add(id);
-      q += ', (?, ?)';
+      q += ", (?, ?, 'member')";
       binds.push(chatID, id);
     }
     await env.DB.prepare(q).bind(...binds).run();
@@ -875,6 +903,326 @@ async function createChat(req: Request, env: Env, user: User): Promise<Response>
   }
 
   return text('Тип чата: direct или group', 400);
+}
+
+// ---------- Групповое управление: роли, участники, ссылки-приглашения ----------
+// Только в облаке (в main.go соответствия нет — см. дорожную карту).
+const MAX_GROUP_MEMBERS = 200;
+const INVITE_DAYS = 7;
+
+function isGroupManager(role: string | null): boolean {
+  return role === 'owner' || role === 'admin';
+}
+
+async function chatRole(env: Env, chatID: number, userID: number): Promise<string | null> {
+  const row = await env.DB.prepare(
+    'SELECT role FROM chat_members WHERE chat_id = ? AND user_id = ? LIMIT 1',
+  ).bind(chatID, userID).first<{ role: string }>();
+  return row?.role || null;
+}
+
+async function invalidateMembers(env: Env, chatID: number): Promise<void> {
+  try {
+    const stub = env.HUB.get(env.HUB.idFromName('hub'));
+    await stub.fetch(`https://hub/invalidate?chat=${chatID}`, { method: 'POST' });
+  } catch { /* хаб спит — сам подтянет из D1 по TTL */ }
+}
+
+// Точечно сообщить одному юзеру (кик из группы и подобное).
+async function notifyUser(env: Env, userID: number, frame: unknown): Promise<void> {
+  try {
+    const stub = env.HUB.get(env.HUB.idFromName('hub'));
+    await stub.fetch('https://hub/notify', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ userId: userID, frame }),
+    });
+  } catch { /* нет сокета — узнает при следующей загрузке */ }
+}
+
+// Системное сообщение в чат: в БД (type=system) и всем на WS.
+async function systemMessage(env: Env, chatID: number, message: string): Promise<void> {
+  const saved = await saveAndBroadcast(env, {
+    chatId: chatID, userId: 0, username: 'System',
+    text: message, type: 'system', timestamp: hhmmss(),
+  } as Frame);
+  await broadcastOnly(env, saved);
+}
+
+function randomInviteToken(): string {
+  const bytes = new Uint8Array(18);
+  crypto.getRandomValues(bytes);
+  let raw = '';
+  for (const b of bytes) raw += String.fromCharCode(b);
+  return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// Полная карточка группы: состав с ролями, мой статус и активная ссылка (для админов).
+async function groupInfo(env: Env, chatID: number, viewer: number): Promise<Response> {
+  const chat = await env.DB.prepare(
+    'SELECT id, type, title, created_by FROM chats WHERE id = ? LIMIT 1',
+  ).bind(chatID).first<{ id: number; type: string; title: string; created_by: number }>();
+  if (!chat) return text('Чат не найден', 404);
+
+  const rows = await env.DB.prepare(
+    `SELECT u.id, u.username, u.avatar, cm.role, cm.joined_at
+     FROM chat_members cm JOIN users u ON u.id = cm.user_id
+     WHERE cm.chat_id = ?
+     ORDER BY CASE cm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
+              u.username COLLATE NOCASE`,
+  ).bind(chatID).all<any>();
+
+  let onlineIDs = new Set<number>();
+  try {
+    const stub = env.HUB.get(env.HUB.idFromName('hub'));
+    const resp = await stub.fetch('https://hub/online');
+    const data = await resp.json() as { ids?: number[] };
+    onlineIDs = new Set(data.ids || []);
+  } catch { /* онлайн не критичен */ }
+
+  const myRole = await chatRole(env, chatID, viewer);
+  const members = (rows.results || []).map((m: any) => ({
+    id: m.id, username: m.username, avatar: m.avatar || '',
+    role: m.role || 'member', joinedAt: m.joined_at || '',
+    online: onlineIDs.has(m.id),
+  }));
+
+  let invite: { token: string; expiresAt: string } | null = null;
+  if (isGroupManager(myRole)) {
+    const inv = await env.DB.prepare(
+      `SELECT token, expires_at AS expiresAt FROM chat_invites
+       WHERE chat_id = ? AND datetime(expires_at) > datetime('now')
+       ORDER BY created_at DESC LIMIT 1`,
+    ).bind(chatID).first<{ token: string; expiresAt: string }>();
+    if (inv) invite = inv;
+  }
+
+  return json({
+    chat: { id: chat.id, type: chat.type, title: chat.title, createdBy: chat.created_by || 0 },
+    myRole, members, invite,
+  });
+}
+
+async function groupAddMembers(req: Request, env: Env, me: User, chatID: number): Promise<Response> {
+  if (chatID === 1) return text('Общий чат: управление недоступно', 400);
+  const role = await chatRole(env, chatID, me.id);
+  if (!isGroupManager(role)) return text('Нет прав на управление группой', 403);
+
+  let body: { usernames?: string[] };
+  try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
+  const names = [...new Set((body.usernames || []).map((n) => String(n).trim()).filter(Boolean))];
+  if (!names.length) return text('Выберите, кого добавить', 400);
+  if (names.length > 50) return text('Слишком много участников за раз (максимум 50)', 400);
+
+  const countRow = await env.DB.prepare(
+    'SELECT COUNT(*) AS n FROM chat_members WHERE chat_id = ?',
+  ).bind(chatID).first<{ n: number }>();
+  if ((countRow?.n || 0) + names.length > MAX_GROUP_MEMBERS) {
+    return text(`В группе может быть не больше ${MAX_GROUP_MEMBERS} участников`, 400);
+  }
+
+  const added: string[] = [];
+  for (const name of names) {
+    const u = await env.DB.prepare(
+      'SELECT id, username FROM users WHERE username = ? COLLATE NOCASE LIMIT 1',
+    ).bind(name).first<{ id: number; username: string }>();
+    if (!u) return text(`Пользователь "${name}" не найден`, 404);
+    const res = await env.DB.prepare(
+      "INSERT OR IGNORE INTO chat_members (chat_id, user_id, role) VALUES (?, ?, 'member')",
+    ).bind(chatID, u.id).run();
+    if (res.meta.changes) added.push(u.username);
+  }
+  if (!added.length) return text('Эти пользователи уже в группе', 409);
+
+  await invalidateMembers(env, chatID);
+  await systemMessage(env, chatID, `${added.map((n) => `@${n}`).join(', ')} добавлен(ы) в группу`);
+  return json({ ok: true, added });
+}
+
+async function groupKick(req: Request, env: Env, me: User, chatID: number): Promise<Response> {
+  if (chatID === 1) return text('Общий чат: управление недоступно', 400);
+  const myRole = await chatRole(env, chatID, me.id);
+  if (!isGroupManager(myRole)) return text('Нет прав на управление группой', 403);
+
+  let body: { userId?: number };
+  try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
+  const targetID = Number(body.userId) || 0;
+  if (!targetID) return text('Не указан участник', 400);
+  if (targetID === me.id) return text('Чтобы выйти, используйте «Выйти из группы»', 400);
+
+  const target = await env.DB.prepare(
+    `SELECT u.id, u.username, cm.role FROM chat_members cm
+     JOIN users u ON u.id = cm.user_id WHERE cm.chat_id = ? AND cm.user_id = ? LIMIT 1`,
+  ).bind(chatID, targetID).first<{ id: number; username: string; role: string }>();
+  if (!target) return text('Участник не найден', 404);
+  if (target.role === 'owner') return text('Нельзя исключить владельца группы', 403);
+  if (myRole === 'admin' && target.role === 'admin') {
+    return text('Администратор не может исключить администратора', 403);
+  }
+
+  await env.DB.prepare('DELETE FROM chat_members WHERE chat_id = ? AND user_id = ?')
+    .bind(chatID, targetID).run();
+  await invalidateMembers(env, chatID);
+  await notifyUser(env, targetID, {
+    type: 'chat_removed', chatId: chatID,
+    text: `Вас исключили из группы «${(await env.DB.prepare(
+      'SELECT title FROM chats WHERE id = ?').bind(chatID).first<{ title: string }>())?.title || 'группа'}»`,
+  });
+  await systemMessage(env, chatID, `@${target.username} исключён(а) из группы`);
+  return json({ ok: true });
+}
+
+async function groupLeave(env: Env, me: User, chatID: number): Promise<Response> {
+  if (chatID === 1) return text('Из общего чата нельзя выйти', 400);
+  const chat = await env.DB.prepare(
+    'SELECT id, type, title FROM chats WHERE id = ? LIMIT 1',
+  ).bind(chatID).first<{ id: number; type: string; title: string }>();
+  if (!chat) return text('Чат не найден', 404);
+  if (chat.type !== 'group') return text('Выйти можно только из группы', 400);
+
+  const role = await chatRole(env, chatID, me.id);
+  if (!role) return text('Вы не в этой группе', 404);
+
+  await env.DB.prepare('DELETE FROM chat_members WHERE chat_id = ? AND user_id = ?')
+    .bind(chatID, me.id).run();
+  await invalidateMembers(env, chatID);
+
+  if (role === 'owner') {
+    // Владелец ушёл — передаём группу старшему админу, иначе старшему участнику.
+    const next = await env.DB.prepare(
+      `SELECT u.id, u.username FROM chat_members cm JOIN users u ON u.id = cm.user_id
+       WHERE cm.chat_id = ? ORDER BY CASE cm.role WHEN 'admin' THEN 0 ELSE 1 END,
+       cm.joined_at ASC LIMIT 1`,
+    ).bind(chatID).first<{ id: number; username: string }>();
+    if (!next) {
+      // Последний участник — группа больше не нужна.
+      await env.DB.prepare('DELETE FROM chat_invites WHERE chat_id = ?').bind(chatID).run();
+      await env.DB.prepare('DELETE FROM messages WHERE chat_id = ?').bind(chatID).run();
+      await env.DB.prepare('DELETE FROM chats WHERE id = ?').bind(chatID).run();
+      return json({ ok: true, deleted: true });
+    }
+    await env.DB.prepare("UPDATE chat_members SET role = 'owner' WHERE chat_id = ? AND user_id = ?")
+      .bind(chatID, next.id).run();
+    await systemMessage(env, chatID,
+      `@${me.username} покинул(а) группу. Новый владелец — @${next.username}`);
+  } else {
+    await systemMessage(env, chatID, `@${me.username} покинул(а) группу`);
+  }
+  return json({ ok: true });
+}
+
+async function groupSetRole(req: Request, env: Env, me: User, chatID: number): Promise<Response> {
+  if (chatID === 1) return text('Общий чат: управление недоступно', 400);
+  const myRole = await chatRole(env, chatID, me.id);
+  if (myRole !== 'owner') return text('Менять роли может только владелец группы', 403);
+
+  let body: { userId?: number; role?: string };
+  try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
+  const targetID = Number(body.userId) || 0;
+  const role = String(body.role || '');
+  if (!targetID) return text('Не указан участник', 400);
+  if (role !== 'admin' && role !== 'member') return text('Роль: admin или member', 400);
+
+  const target = await env.DB.prepare(
+    `SELECT u.id, u.username, cm.role FROM chat_members cm
+     JOIN users u ON u.id = cm.user_id WHERE cm.chat_id = ? AND cm.user_id = ? LIMIT 1`,
+  ).bind(chatID, targetID).first<{ id: number; username: string; role: string }>();
+  if (!target) return text('Участник не найден', 404);
+  if (target.role === 'owner') return text('Нельзя менять роль владельца', 403);
+  if (target.role === role) return json({ ok: true, role });
+
+  await env.DB.prepare('UPDATE chat_members SET role = ? WHERE chat_id = ? AND user_id = ?')
+    .bind(role, chatID, targetID).run();
+  await systemMessage(env, chatID, role === 'admin'
+    ? `@${target.username} теперь администратор группы`
+    : `@${target.username} больше не администратор`);
+  return json({ ok: true, role });
+}
+
+async function groupCreateInvite(env: Env, me: User, chatID: number): Promise<Response> {
+  if (chatID === 1) return text('Общий чат: приглашения не нужны', 400);
+  const myRole = await chatRole(env, chatID, me.id);
+  if (!isGroupManager(myRole)) return text('Нет прав на управление группой', 403);
+
+  const chat = await env.DB.prepare(
+    "SELECT id, type FROM chats WHERE id = ? AND type = 'group' LIMIT 1",
+  ).bind(chatID).first<{ id: number; type: string }>();
+  if (!chat) return text('Группа не найдена', 404);
+
+  const token = randomInviteToken();
+  // Держим одну активную ссылку на группу: старая тихо перестаёт работать.
+  await env.DB.prepare('DELETE FROM chat_invites WHERE chat_id = ?').bind(chatID).run();
+  await env.DB.prepare(
+    `INSERT INTO chat_invites (token, chat_id, created_by, expires_at)
+     VALUES (?, ?, ?, datetime('now', '+${INVITE_DAYS} days'))`,
+  ).bind(token, chatID, me.id).run();
+
+  const row = await env.DB.prepare(
+    'SELECT expires_at AS expiresAt FROM chat_invites WHERE token = ? LIMIT 1',
+  ).bind(token).first<{ expiresAt: string }>();
+  return json({ ok: true, token, expiresAt: row?.expiresAt || '' });
+}
+
+async function groupRevokeInvite(env: Env, me: User, chatID: number): Promise<Response> {
+  const myRole = await chatRole(env, chatID, me.id);
+  if (!isGroupManager(myRole)) return text('Нет прав на управление группой', 403);
+  await env.DB.prepare('DELETE FROM chat_invites WHERE chat_id = ?').bind(chatID).run();
+  return json({ ok: true });
+}
+
+async function findInvite(env: Env, token: string) {
+  return env.DB.prepare(
+    `SELECT i.token, i.chat_id AS chatId, i.expires_at AS expiresAt, i.uses,
+            c.title, c.type, c.created_by AS createdBy,
+            u.username AS invitedBy
+     FROM chat_invites i
+     JOIN chats c ON c.id = i.chat_id
+     LEFT JOIN users u ON u.id = i.created_by
+     WHERE i.token = ? AND datetime(i.expires_at) > datetime('now') LIMIT 1`,
+  ).bind(token).first<any>();
+}
+
+async function invitePreview(env: Env, me: User, token: string): Promise<Response> {
+  if (!/^[A-Za-z0-9_-]{10,64}$/.test(token)) return text('Приглашение не найдено', 404);
+  const inv = await findInvite(env, token);
+  if (!inv) return text('Приглашение не найдено или истекло', 404);
+  const already = await isMember(env, inv.chatId, me.id);
+  const count = await env.DB.prepare(
+    'SELECT COUNT(*) AS n FROM chat_members WHERE chat_id = ?',
+  ).bind(inv.chatId).first<{ n: number }>();
+  return json({
+    invite: {
+      chat: { id: inv.chatId, title: inv.title || 'Группа', type: inv.type },
+      invitedBy: inv.invitedBy || '',
+      expiresAt: inv.expiresAt || '',
+      membersCount: count?.n || 0,
+      alreadyMember: already,
+    },
+  });
+}
+
+async function joinInvite(env: Env, me: User, token: string): Promise<Response> {
+  if (!/^[A-Za-z0-9_-]{10,64}$/.test(token)) return text('Приглашение не найдено', 404);
+  const inv = await findInvite(env, token);
+  if (!inv) return text('Приглашение не найдено или истекло', 404);
+
+  if (await isMember(env, inv.chatId, me.id)) {
+    return json({ ok: true, already: true, chatId: inv.chatId });
+  }
+  const count = await env.DB.prepare(
+    'SELECT COUNT(*) AS n FROM chat_members WHERE chat_id = ?',
+  ).bind(inv.chatId).first<{ n: number }>();
+  if ((count?.n || 0) >= MAX_GROUP_MEMBERS) {
+    return text(`В группе уже ${MAX_GROUP_MEMBERS} участников`, 400);
+  }
+
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO chat_members (chat_id, user_id, role) VALUES (?, ?, 'member')",
+  ).bind(inv.chatId, me.id).run();
+  await env.DB.prepare('UPDATE chat_invites SET uses = uses + 1 WHERE token = ?').bind(token).run();
+  await invalidateMembers(env, inv.chatId);
+  await systemMessage(env, inv.chatId, `@${me.username} вступил(а) в группу по ссылке`);
+  return json({ ok: true, chatId: inv.chatId });
 }
 
 // ---------- Файлы ----------

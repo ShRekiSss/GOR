@@ -55,6 +55,26 @@ export class Hub {
       });
     }
 
+    // Сброс кэша участников после добавления/кика/выхода: иначе до минуты
+    // новый участник не получает сообщения, а исключённый продолжает получать.
+    if (url.pathname === '/invalidate' && req.method === 'POST') {
+      const chatID = Number(url.searchParams.get('chat')) || 0;
+      if (chatID > 0) this.memberCache.delete(chatID);
+      else this.memberCache.clear();
+      return new Response('ok');
+    }
+
+    // Точечный кадр конкретному юзеру (например, «вас исключили из группы»).
+    if (url.pathname === '/notify' && req.method === 'POST') {
+      const body = await req.json() as { userId?: number; frame?: unknown };
+      const uid = Number(body.userId) || 0;
+      if (!uid || !body.frame) return new Response('bad', { status: 400 });
+      for (const [id, t] of this.sockets) {
+        if (t.userID === uid) this.sendTo(id, t, body.frame);
+      }
+      return new Response('ok');
+    }
+
     if (url.pathname === '/broadcast' && req.method === 'POST') {
       const frame = await req.json() as Frame;
       await this.broadcast(frame);

@@ -30,6 +30,13 @@ const ADMIN_ACTION_LABELS = {
   delete: 'удаление аккаунта',
 };
 
+// Роли участников группы.
+const GROUP_ROLE_LABELS = {
+  owner: 'владелец',
+  admin: 'администратор',
+  member: 'участник',
+};
+
 // --- Время сообщений ---
 // Новый формат — ISO UTC от сервера ("2026-10-22T09:41:00Z"):
 // сегодня → «12:41», вчера → «вчера 12:41», иначе «22.10, 12:41» — в локальном времени.
@@ -145,6 +152,16 @@ function App() {
   const [groupTitle, setGroupTitle] = useState('');
   const [groupMembers, setGroupMembers] = useState([]);
   const [chatError, setChatError] = useState('');
+  // Панель группы: состав, роли, приглашение по ссылке.
+  const [groupOpen, setGroupOpen] = useState(false);
+  const [groupData, setGroupData] = useState(null);
+  const [groupBusy, setGroupBusy] = useState(false);
+  const [groupAddQuery, setGroupAddQuery] = useState('');
+  const [groupAddResults, setGroupAddResults] = useState([]);
+  // Приглашение по ссылке: токен из /invite/:token ждёт входа/подтверждения.
+  const [pendingInvite, setPendingInvite] = useState('');
+  const [invitePreviewData, setInvitePreviewData] = useState(null);
+  const [inviteBusy, setInviteBusy] = useState(false);
   const [autostart, setAutostart] = useState(false);
   // Панель разраба (для админов): лист юзеров, бан/разбан, переминовка.
   const [adminPanel, setAdminPanel] = useState(false);
@@ -649,6 +666,18 @@ function App() {
           }
           return;
         }
+        if (incoming.type === 'chat_removed') {
+          // Меня исключили из группы: убираем чат и закрываем его, если открыт.
+          setChats((prev) => prev.filter((c) => c.id !== incoming.chatId));
+          if (activeChatRef.current === incoming.chatId) {
+            setActiveChatId(null);
+            setMessages([]);
+            messagesSetRef.current.clear();
+            setMobileChatOpen(false);
+          }
+          showToast(incoming.text || 'Чат больше недоступен');
+          return;
+        }
         if (incoming.type === 'edit') {
           setMessages((prev) => prev.map((m) => (m.id === incoming.id ? { ...m, text: incoming.text, edited: 1 } : m)));
           return;
@@ -683,7 +712,7 @@ function App() {
               lastIdRef.current = Math.max(lastIdRef.current, message.id);
             }
           }
-          if (message.userId !== user.id && message.id) {
+          if (message.userId !== user.id && message.id && message.type !== 'system') {
             markRead(message.chatId, message.id);
           }
         }
@@ -701,7 +730,9 @@ function App() {
             lastTime: message.timestamp || current.lastTime,
             unread: isActive
               ? 0
-              : (message.userId === user.id ? current.unread : (current.unread || 0) + 1),
+              : (message.userId === user.id || message.type === 'system'
+                ? current.unread
+                : (current.unread || 0) + 1),
           };
           const rest = prev.filter((_, i) => i !== index);
           return [updated, ...rest];
@@ -711,7 +742,7 @@ function App() {
           loadChats();
         }
 
-        if (!isActive || document.hidden) {
+        if (message.type !== 'system' && (!isActive || document.hidden)) {
           notify(message);
         }
       };
@@ -790,6 +821,60 @@ function App() {
     openUserProfile(name);
     return undefined;
   }, [user]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Ссылка-приглашение /invite/:token: запоминаем до входа, открываем после.
+  useEffect(() => {
+    const m = /\/invite\/([A-Za-z0-9_-]{10,64})/.exec(window.location.pathname);
+    let saved = '';
+    try { saved = localStorage.getItem('pendingInvite') || ''; } catch { /* режим инкогнито */ }
+    if (m) {
+      window.history.replaceState(null, '', '/');
+      try { localStorage.setItem('pendingInvite', m[1]); } catch { /* ок */ }
+      setPendingInvite(m[1]);
+    } else if (saved) {
+      setPendingInvite(saved);
+    }
+  }, []);
+
+  // Токен есть, юзер вошёл — показываем карточку приглашения.
+  useEffect(() => {
+    if (!user || !pendingInvite) return undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await authFetch(`/api/invite/${pendingInvite}`);
+        const t = await r.text();
+        if (cancelled) return;
+        if (!r.ok) {
+          showToast(t.trim() || 'Приглашение недействительно');
+          setPendingInvite('');
+          try { localStorage.removeItem('pendingInvite'); } catch { /* ок */ }
+          return;
+        }
+        let data = null;
+        try { data = JSON.parse(t); } catch { /* пусто */ }
+        if (data?.invite) setInvitePreviewData(data.invite);
+      } catch { /* сеть дрогнула — попробуем при следующем входе */ }
+    })();
+    return () => { cancelled = true; };
+  }, [user, pendingInvite]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Поиск людей для добавления в группу.
+  useEffect(() => {
+    if (!groupOpen) return undefined;
+    const query = groupAddQuery.trim();
+    if (!query) { setGroupAddResults([]); return undefined; }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        const r = await authFetch(`/api/users?q=${encodeURIComponent(query)}`);
+        if (!r.ok) return;
+        const d = await r.json();
+        if (!cancelled) setGroupAddResults(d.users || []);
+      } catch { /* поиск не критичен */ }
+    }, 250);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [groupOpen, groupAddQuery]);
 
   useEffect(() => {
     chatsRef.current = chats;
@@ -1886,6 +1971,158 @@ function App() {
       closeModal();
     } catch (error) {
       setChatError(error.message || 'Не удалось создать группу');
+    }
+  };
+
+  // ---------- Панель группы ----------
+  const loadGroup = async (chatId, silent = false) => {
+    if (!chatId) return;
+    setGroupBusy(true);
+    try {
+      const r = await authFetch(`/api/chats/${chatId}/members`);
+      const t = await r.text();
+      if (!r.ok) {
+        if (!silent) showToast(t.trim() || 'Не удалось открыть группу');
+        return;
+      }
+      let data = null;
+      try { data = JSON.parse(t); } catch { /* пусто */ }
+      if (data) setGroupData(data);
+    } catch {
+      if (!silent) showToast('Сеть дрогнула — состав не загрузился');
+    } finally {
+      setGroupBusy(false);
+    }
+  };
+
+  const openGroup = async () => {
+    if (!activeChat || activeChat.type !== 'group') return;
+    setGroupOpen(true);
+    setGroupData(null);
+    setGroupAddQuery('');
+    setGroupAddResults([]);
+    await loadGroup(activeChat.id);
+  };
+
+  const closeGroup = () => {
+    setGroupOpen(false);
+    setGroupData(null);
+    setGroupAddQuery('');
+    setGroupAddResults([]);
+  };
+
+  const groupAction = async (action, body, okText, method = 'POST') => {
+    const chatId = groupData?.chat?.id || activeChat?.id;
+    if (!chatId) return null;
+    setGroupBusy(true);
+    try {
+      const r = await authFetch(`/api/chats/${chatId}/${action}`, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: method === 'DELETE' ? undefined : JSON.stringify(body || {}),
+      });
+      const t = await r.text();
+      if (!r.ok) { showToast(t.trim() || 'Не вышло'); return null; }
+      let data = null;
+      try { data = JSON.parse(t); } catch { /* пусто */ }
+      if (okText) showToast(okText);
+      return data;
+    } catch {
+      showToast('Сеть дрогнула — действие не прошло');
+      return null;
+    } finally {
+      setGroupBusy(false);
+    }
+  };
+
+  const groupInvite = async () => {
+    const d = await groupAction('invite', {}, null);
+    if (!d?.token) return;
+    const link = `${window.location.origin}/invite/${d.token}`;
+    try {
+      await navigator.clipboard.writeText(link);
+      showToast('Ссылка-приглашение скопирована');
+    } catch {
+      showToast(link);
+    }
+    await loadGroup(groupData?.chat?.id || activeChat?.id, true);
+  };
+
+  const groupCopyInvite = async () => {
+    const token = groupData?.invite?.token;
+    if (!token) return groupInvite();
+    const link = `${window.location.origin}/invite/${token}`;
+    try {
+      await navigator.clipboard.writeText(link);
+      showToast('Ссылка скопирована');
+    } catch {
+      showToast(link);
+    }
+  };
+
+  const groupRevokeInvite = async () => {
+    if (!window.confirm('Отозвать ссылку-приглашение? Старая перестанет работать.')) return;
+    const d = await groupAction('invite', null, 'Ссылка отозвана', 'DELETE');
+    if (d) await loadGroup(groupData?.chat?.id || activeChat?.id, true);
+  };
+
+  const groupAdd = async (name) => {
+    const d = await groupAction('members', { usernames: [name] }, `@${name} добавлен(а)`);
+    if (!d) return;
+    setGroupAddQuery('');
+    setGroupAddResults([]);
+    await loadGroup(groupData?.chat?.id || activeChat?.id, true);
+  };
+
+  const groupKick = async (m) => {
+    if (!window.confirm(`Исключить @${m.username} из группы?`)) return;
+    const d = await groupAction('kick', { userId: m.id }, `@${m.username} исключён(а)`);
+    if (d) await loadGroup(groupData?.chat?.id || activeChat?.id, true);
+  };
+
+  const groupToggleRole = async (m) => {
+    const role = m.role === 'admin' ? 'member' : 'admin';
+    const d = await groupAction('role', { userId: m.id, role },
+      role === 'admin' ? 'Назначен администратором' : 'Снят с администраторов');
+    if (d) await loadGroup(groupData?.chat?.id || activeChat?.id, true);
+  };
+
+  const groupLeave = async () => {
+    if (!window.confirm('Выйти из группы? Вернуться можно только по новой ссылке.')) return;
+    const chatId = groupData?.chat?.id || activeChat?.id;
+    const d = await groupAction('leave', {}, 'Вы вышли из группы');
+    if (!d) return;
+    closeGroup();
+    setActiveChatId(null);
+    setMessages([]);
+    messagesSetRef.current.clear();
+    setMobileChatOpen(false);
+    await loadChats();
+    if (chatId) showToast('Вы вышли из группы');
+  };
+
+  const clearPendingInvite = () => {
+    setPendingInvite('');
+    setInvitePreviewData(null);
+    try { localStorage.removeItem('pendingInvite'); } catch { /* ок */ }
+  };
+
+  const acceptInvite = async () => {
+    if (!pendingInvite) return;
+    setInviteBusy(true);
+    try {
+      const r = await authFetch(`/api/invite/${pendingInvite}`, { method: 'POST' });
+      const t = await r.text();
+      if (!r.ok) { showToast(t.trim() || 'Не удалось вступить'); return; }
+      let d = null;
+      try { d = JSON.parse(t); } catch { /* пусто */ }
+      showToast(d?.already ? 'Вы уже в этой группе' : 'Вы вступили в группу');
+      clearPendingInvite();
+      if (d?.chatId) await loadChats(d.chatId);
+    } catch {
+      showToast('Сеть дрогнула — попробуйте ещё раз');
+    } finally {
+      setInviteBusy(false);
     }
   };
 
@@ -3092,10 +3329,22 @@ function App() {
               {typingUser
                 ? `${typingUser} печатает…`
                 : activeChat
-                ? (activeChat.type === 'group' ? 'групповой чат' : 'личный чат')
+                ? (activeChat.type === 'group'
+                  ? (activeChat.membersCount ? `групповой чат · ${activeChat.membersCount} участн.` : 'групповой чат')
+                  : 'личный чат')
                 : 'выберите чат или создайте новый'}
             </span>
           </div>
+          {activeChat?.type === 'group' && (
+            <button
+              type="button"
+              className="call-button group-button"
+              onClick={openGroup}
+              title="Участники и настройки группы"
+            >
+              👥
+            </button>
+          )}
           {activeChat && (
             <button
               type="button"
@@ -3801,6 +4050,195 @@ function App() {
               <button type="submit" className="settings-save">СОХРАНИТЬ</button>
             </div>
           </form>
+        </div>
+      )}
+
+      {groupOpen && (
+        <div className="settings-overlay" onClick={closeGroup}>
+          <div
+            className="settings-card group-card"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {(() => {
+              const g = groupData;
+              const chatId = g?.chat?.id || activeChat?.id || 0;
+              const myRole = g?.myRole || 'member';
+              const isOwner = myRole === 'owner';
+              const canManage = isOwner || myRole === 'admin';
+              const memberIds = new Set((g?.members || []).map((m) => m.id));
+              return (
+                <>
+                  <div className="admin-head">
+                    <h2># {g?.chat?.title || activeChat?.title || 'Группа'}</h2>
+                    <button
+                      type="button"
+                      className="admin-refresh"
+                      onClick={() => loadGroup(chatId)}
+                      disabled={groupBusy}
+                      title="Обновить состав"
+                    >
+                      {groupBusy ? '…' : '⟳'}
+                    </button>
+                  </div>
+                  <div className="group-sub">
+                    {g ? `${g.members.length} ${g.members.length === 1 ? 'участник' : 'участников'}` : 'загрузка…'}
+                    {g && g.myRole ? ` · ваша роль: ${GROUP_ROLE_LABELS[g.myRole] || g.myRole}` : ''}
+                  </div>
+
+                  {g && chatId !== 1 && canManage && (
+                    <div className="group-invite">
+                      <div className="group-section-title">Ссылка-приглашение</div>
+                      {g.invite ? (
+                        <>
+                          <code className="group-invite-link">
+                            {`${window.location.origin}/invite/${g.invite.token}`}
+                          </code>
+                          <div className="group-invite-actions">
+                            <button type="button" onClick={groupCopyInvite}>скопировать</button>
+                            <button type="button" className="danger" onClick={groupRevokeInvite}>отозвать</button>
+                          </div>
+                          <div className="group-hint">
+                            действует до {fmtTsLocal(g.invite.expiresAt)}
+                          </div>
+                        </>
+                      ) : (
+                        <button type="button" className="group-invite-create" onClick={groupInvite}>
+                          создать ссылку
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {g && chatId !== 1 && canManage && (
+                    <div className="group-add">
+                      <div className="group-section-title">Добавить участника</div>
+                      <input
+                        type="text"
+                        className="admin-search"
+                        value={groupAddQuery}
+                        onChange={(e) => setGroupAddQuery(e.target.value)}
+                        placeholder="Ник пользователя…"
+                      />
+                      {groupAddQuery.trim() && (
+                        <div className="group-add-results">
+                          {groupAddResults.filter((u) => !memberIds.has(u.id)).slice(0, 6).map((u) => (
+                            <button
+                              type="button"
+                              key={u.id}
+                              className="group-add-row"
+                              onClick={() => groupAdd(u.username)}
+                            >
+                              <span>@{u.username}</span>
+                              <span className="group-add-plus">+</span>
+                            </button>
+                          ))}
+                          {groupAddResults.filter((u) => !memberIds.has(u.id)).length === 0 && (
+                            <div className="group-hint">Никого не нашлось</div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="group-members">
+                    {(g?.members || []).map((m) => (
+                      <div className="group-member" key={m.id}>
+                        {m.avatar
+                          ? <img className="admin-avatar" src={resolveUrl(m.avatar)} alt="" />
+                          : <span className="admin-avatar">{(m.username || '?')[0].toUpperCase()}</span>}
+                        <div className="group-member-main">
+                          <div className="group-member-name">
+                            {m.username}{m.id === user?.id ? ' (вы)' : ''}
+                          </div>
+                          <div className="group-member-sub">
+                            {GROUP_ROLE_LABELS[m.role] || m.role}
+                            {m.online ? ' · онлайн' : ''}
+                          </div>
+                        </div>
+                        {chatId !== 1 && m.id !== user?.id && m.role !== 'owner' && (
+                          <div className="group-member-actions">
+                            {isOwner && (
+                              <button type="button" onClick={() => groupToggleRole(m)}>
+                                {m.role === 'admin' ? 'снять админа' : 'сделать админом'}
+                              </button>
+                            )}
+                            {(isOwner || m.role === 'member') && (
+                              <button type="button" className="danger" onClick={() => groupKick(m)}>
+                                исключить
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                    {!g && <div className="admin-empty">Загрузка состава…</div>}
+                  </div>
+
+                  {g && chatId !== 1 && (
+                    <div className="group-footer">
+                      <button type="button" className="group-leave" onClick={groupLeave}>
+                        Выйти из группы
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="settings-actions">
+                    <button type="button" className="settings-cancel" onClick={closeGroup}>
+                      ЗАКРЫТЬ
+                    </button>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        </div>
+      )}
+
+      {invitePreviewData && (
+        <div className="settings-overlay" onClick={clearPendingInvite}>
+          <div
+            className="settings-card invite-card"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2>Приглашение в группу</h2>
+            <div className="invite-group"># {invitePreviewData.chat?.title || 'Группа'}</div>
+            <div className="invite-sub">
+              {invitePreviewData.membersCount || 0} участник(ов)
+              {invitePreviewData.invitedBy ? ` · пригласил @${invitePreviewData.invitedBy}` : ''}
+            </div>
+            {invitePreviewData.alreadyMember ? (
+              <div className="settings-actions">
+                <button type="button" className="settings-cancel" onClick={clearPendingInvite}>
+                  ЗАКРЫТЬ
+                </button>
+                <button
+                  type="button"
+                  className="settings-save"
+                  onClick={async () => {
+                    const id = invitePreviewData.chat?.id;
+                    clearPendingInvite();
+                    if (id) await loadChats(id);
+                  }}
+                >
+                  ОТКРЫТЬ ЧАТ
+                </button>
+              </div>
+            ) : (
+              <div className="settings-actions">
+                <button type="button" className="settings-cancel" onClick={clearPendingInvite}>
+                  ОТМЕНА
+                </button>
+                <button
+                  type="button"
+                  className="settings-save"
+                  onClick={acceptInvite}
+                  disabled={inviteBusy}
+                >
+                  {inviteBusy ? 'ВСТУПАЕМ…' : 'ВСТУПИТЬ'}
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       )}
 
