@@ -46,6 +46,15 @@ export class Hub {
       });
     }
 
+    // Кто именно сейчас на связи (для админки: фильтр «онлайн»).
+    if (url.pathname === '/online') {
+      const ids = new Set<number>();
+      for (const [, s] of this.sockets) if (s.userID) ids.add(s.userID);
+      return new Response(JSON.stringify({ ids: [...ids] }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
     if (url.pathname === '/broadcast' && req.method === 'POST') {
       const frame = await req.json() as Frame;
       await this.broadcast(frame);

@@ -19,6 +19,17 @@ import { pushEnable, pushDisable, pushState, initPushRouting } from './app-push'
 // Порог мобильной (Android/PWA) раскладки — совпадает с CSS @media.
 const MOBILE_MQ = '(max-width: 820px)';
 
+// Подписи действий в журнале админки.
+const ADMIN_ACTION_LABELS = {
+  ban: 'бан',
+  unban: 'разбан',
+  rename: 'переименование',
+  admin_on: 'выдал админку',
+  admin_off: 'снял админку',
+  logout: 'сброс входов',
+  delete: 'удаление аккаунта',
+};
+
 // --- Время сообщений ---
 // Новый формат — ISO UTC от сервера ("2026-10-22T09:41:00Z"):
 // сегодня → «12:41», вчера → «вчера 12:41», иначе «22.10, 12:41» — в локальном времени.
@@ -139,6 +150,10 @@ function App() {
   const [adminPanel, setAdminPanel] = useState(false);
   const [adminUsers, setAdminUsers] = useState([]);
   const [adminBusy, setAdminBusy] = useState(false);
+  const [adminStats, setAdminStats] = useState({});
+  const [adminActions, setAdminActions] = useState([]);
+  const [adminQuery, setAdminQuery] = useState('');
+  const [adminFilter, setAdminFilter] = useState('all');
   // Профиль WeChat-стиля: свой (редактируемый) или чужой (публичная карточка).
   const [profileOpen, setProfileOpen] = useState(false);
   const [profileData, setProfileData] = useState(null);
@@ -2041,9 +2056,12 @@ function App() {
   // ---------- Профиль WeChat-стиля ----------
   const fmtTsLocal = (ts) => {
     if (!ts) return '—';
-    const s = String(ts).includes('-')
-      ? new Date(`${String(ts).replace(' ', 'T')}Z`)
-      : new Date(Number(ts) * 1000);
+    const raw = String(ts);
+    // Старые сообщения хранят только «ЧЧ:ММ:СС» — показываем как есть.
+    if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(raw)) return raw;
+    const s = raw.includes('-')
+      ? new Date(`${raw.replace(' ', 'T')}${raw.endsWith('Z') ? '' : 'Z'}`)
+      : new Date(Number(raw) * 1000);
     return Number.isNaN(s.getTime()) ? '—' : s.toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
   };
 
@@ -2128,42 +2146,91 @@ function App() {
     } catch { showToast('Лист юзеров не загрузился'); } finally { setAdminBusy(false); }
   };
 
+  const loadAdminStats = async () => {
+    try {
+      const r = await authFetch('/api/admin/stats');
+      if (!r.ok) return;
+      const d = await r.json();
+      setAdminStats(d.stats || {});
+    } catch { /* статистика не критична */ }
+  };
+
+  const loadAdminActions = async () => {
+    try {
+      const r = await authFetch('/api/admin/actions?limit=30');
+      if (!r.ok) return;
+      const d = await r.json();
+      setAdminActions(d.actions || []);
+    } catch { /* журнал не критичен */ }
+  };
+
+  const refreshAdmin = async () => {
+    await Promise.all([loadAdminUsers(), loadAdminStats(), loadAdminActions()]);
+  };
+
   const openAdmin = async () => {
     setAdminPanel(true);
-    await loadAdminUsers();
+    setAdminQuery('');
+    setAdminFilter('all');
+    await refreshAdmin();
   };
 
-  const adminBan = async (id, on) => {
-    if (!on && window.confirm === undefined) { /* всегда доступен */ }
+  const adminPost = async (id, action, body, okText) => {
     setAdminBusy(true);
     try {
-      const r = await authFetch(`/api/admin/users/${id}/ban`, {
+      const r = await authFetch(`/api/admin/users/${id}/${action}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ on }),
+        body: JSON.stringify(body || {}),
       });
       const t = await r.text();
-      if (!r.ok) { showToast(t.trim() || 'Не вышло'); return; }
-      showToast(on ? 'Забанен' : 'Разбанен');
-      await loadAdminUsers();
-    } catch { showToast('Бан не прошёл — сеть дрогнула'); } finally { setAdminBusy(false); }
+      if (!r.ok) { showToast(t.trim() || 'Не вышло'); return null; }
+      let data = null;
+      try { data = JSON.parse(t); } catch { /* тело пустое */ }
+      if (okText) showToast(okText);
+      await refreshAdmin();
+      return data;
+    } catch {
+      showToast('Сеть дрогнула — действие не прошло');
+      return null;
+    } finally {
+      setAdminBusy(false);
+    }
   };
 
-  const adminRename = async (id, cur) => {
-    const name = window.prompt('Новый ник (латиница/цифры/_.- 3-32):', cur || '');
-    if (!name || name.trim() === cur) return;
-    setAdminBusy(true);
-    try {
-      const r = await authFetch(`/api/admin/users/${id}/rename`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: name.trim() }),
-      });
-      const t = await r.text();
-      if (!r.ok) { showToast(t.trim() || 'Не вышло'); return; }
-      showToast('Переименован');
-      await loadAdminUsers();
-    } catch { showToast('Переименование не прошло — сеть дрогнула'); } finally { setAdminBusy(false); }
+  const adminBan = async (u) => {
+    const on = !u.banned;
+    if (on && !window.confirm(`Забанить @${u.username}? Все его сессии будут убиты.`)) return;
+    await adminPost(u.id, 'ban', { on }, on ? 'Забанен' : 'Разбанен');
+  };
+
+  const adminRename = async (u) => {
+    const name = window.prompt('Новый ник (латиница/цифры/_.- 3-32):', u.username || '');
+    if (!name || name.trim() === u.username) return;
+    await adminPost(u.id, 'rename', { username: name.trim() }, 'Переименован');
+  };
+
+  const adminLogout = async (u) => {
+    if (!window.confirm(`Разлогинить @${u.username} на всех устройствах?`)) return;
+    await adminPost(u.id, 'logout', {}, 'Сессии сброшены');
+  };
+
+  const adminToggleAdmin = async (u) => {
+    const on = !u.isAdmin;
+    if (!window.confirm(`${on ? 'Выдать' : 'Снять'} права админа у @${u.username}?`)) return;
+    await adminPost(u.id, 'admin', { on }, on ? 'Права выданы' : 'Права сняты');
+  };
+
+  const adminDelete = async (u) => {
+    const typed = window.prompt(
+      `Удалить @${u.username} НАВСЕГДА?\n`
+      + 'Удалятся сообщения, истории, файлы и входы. Это необратимо.\n'
+      + 'Введите ник для подтверждения:',
+      '',
+    );
+    if (typed === null) return;
+    if (typed.trim() !== u.username) { showToast('Ник не совпал — отмена'); return; }
+    await adminPost(u.id, 'delete', { confirm: typed.trim() }, `Удалён @${u.username}`);
   };
 
   // Вкл/выкл Web Push: подписка в SW + учётная запись на сервере.
@@ -2594,6 +2661,19 @@ function App() {
       {renderMirrors(true)}
     </div>
   ) : null;
+
+  // Поиск/фильтр админки считаем на клиенте: юзеров немного, зато мгновенно.
+  const adminFiltered = adminUsers.filter((u) => {
+    const q = adminQuery.trim().toLowerCase();
+    if (q) {
+      const name = String(u.displayName || '').toLowerCase();
+      if (!String(u.username || '').toLowerCase().includes(q) && !name.includes(q)) return false;
+    }
+    if (adminFilter === 'online') return !!u.online;
+    if (adminFilter === 'admins') return !!u.isAdmin;
+    if (adminFilter === 'banned') return !!u.banned;
+    return true;
+  });
 
   if (showServerSetup || (isDesktop() && !server)) {
     return (
@@ -3730,37 +3810,153 @@ function App() {
             className="settings-card admin-card"
             onClick={(e) => e.stopPropagation()}
           >
-            <h2>Панель разраба</h2>
+            <div className="admin-head">
+              <h2>Админ-панель</h2>
+              <button
+                type="button"
+                className="admin-refresh"
+                onClick={refreshAdmin}
+                disabled={adminBusy}
+                title="Обновить данные"
+              >
+                {adminBusy ? '…' : '⟳'}
+              </button>
+            </div>
+
+            <div className="admin-stats">
+              {[
+                ['Пользователи', adminStats.users ?? '—'],
+                ['Онлайн', adminStats.online ?? '—'],
+                ['Сообщения', adminStats.messages ?? '—'],
+                ['Чаты', adminStats.chats ?? '—'],
+                ['Файлы', adminStats.files ?? '—'],
+                ['Объём', formatFileSize(Number(adminStats.filesBytes) || 0)],
+                ['Баны', adminStats.banned ?? '—'],
+                ['Админы', adminStats.admins ?? '—'],
+              ].map(([label, value]) => (
+                <div className="admin-stat" key={label}>
+                  <span className="admin-stat-value">{value}</span>
+                  <span className="admin-stat-label">{label}</span>
+                </div>
+              ))}
+            </div>
+
+            <div className="admin-toolbar">
+              <input
+                type="search"
+                className="admin-search"
+                value={adminQuery}
+                onChange={(e) => setAdminQuery(e.target.value)}
+                placeholder="Поиск по нику или имени…"
+              />
+            </div>
+            <div className="admin-filters">
+              {[
+                ['all', `Все (${adminUsers.length})`],
+                ['online', 'Онлайн'],
+                ['admins', 'Админы'],
+                ['banned', 'Баны'],
+              ].map(([id, label]) => (
+                <button
+                  type="button"
+                  key={id}
+                  className={`admin-filter ${adminFilter === id ? 'active' : ''}`}
+                  onClick={() => setAdminFilter(id)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
             <div className="admin-list">
-              {adminUsers.map((u) => (
+              {adminFiltered.map((u) => (
                 <div key={u.id} className={`admin-row ${u.banned ? 'banned' : ''}`}>
                   <div className="admin-main">
                     <div className="admin-name">
-                      {u.displayName || u.username}
-                      {u.isAdmin ? ' 🛠' : ''}{u.banned ? ' ⛔ забанен' : ''}
+                      {u.avatar
+                        ? <img className="admin-avatar" src={resolveUrl(u.avatar)} alt="" />
+                        : <span className="admin-avatar">{(u.displayName || u.username || '?')[0].toUpperCase()}</span>}
+                      <span className="admin-nick">{u.displayName || u.username}</span>
+                      <span className="admin-badges">
+                        {u.isAdmin ? <span className="admin-badge">🛠 админ</span> : null}
+                        {u.online ? <span className="admin-badge online">● онлайн</span> : null}
+                        {u.banned ? <span className="admin-badge banned">⛔ бан</span> : null}
+                        {u.searchable === 0 ? <span className="admin-badge dim">скрыт</span> : null}
+                      </span>
                     </div>
                     <div className="admin-sub">
-                      @{u.username} · входов: {u.sessions_alive || 0} · последний вход: {fmtTsLocal(u.last_login)} · последнее сообщение: {fmtTsLocal(u.last_message)}
+                      @{u.username} · id {u.id} · рег. {fmtTsLocal(u.createdAt)}
+                      {' · '}входов {u.sessions_alive || 0}
+                      {' · '}сообщ. {u.messages_count || 0}
+                      {' · '}чатов {u.chats_count || 0}
+                    </div>
+                    <div className="admin-sub dim">
+                      последний вход: {fmtTsLocal(u.last_login)}
+                      {' · '}последнее сообщение: {fmtTsLocal(u.last_message)}
                     </div>
                   </div>
                   <div className="admin-actions">
-                    <button type="button" onClick={() => adminRename(u.id, u.username)}>переименовать</button>
                     <button
                       type="button"
-                      className={u.banned ? 'ok' : 'danger'}
-                      onClick={() => adminBan(u.id, !u.banned)}
+                      onClick={() => { setAdminPanel(false); openUserProfile(u.username); }}
                     >
-                      {u.banned ? 'разбанить' : 'бан'}
+                      профиль
                     </button>
+                    <button type="button" onClick={() => adminRename(u)}>ник</button>
+                    {u.id !== user?.id && (
+                      <button
+                        type="button"
+                        className={u.banned ? 'ok' : 'danger'}
+                        onClick={() => adminBan(u)}
+                      >
+                        {u.banned ? 'разбанить' : 'бан'}
+                      </button>
+                    )}
+                    {u.id !== user?.id && (
+                      <button type="button" onClick={() => adminLogout(u)}>разлогинить</button>
+                    )}
+                    {user?.id === 1 && u.id !== user?.id && (
+                      <button type="button" onClick={() => adminToggleAdmin(u)}>
+                        {u.isAdmin ? 'снять админку' : 'выдать админку'}
+                      </button>
+                    )}
+                    {user?.id === 1 && u.id !== user?.id && u.id !== 1 && (
+                      <button type="button" className="danger" onClick={() => adminDelete(u)}>
+                        удалить
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}
-              {adminUsers.length === 0 && (
-                <div className="admin-empty">{adminBusy ? 'Загрузка…' : 'Пусто'}</div>
+              {adminFiltered.length === 0 && (
+                <div className="admin-empty">
+                  {adminBusy ? 'Загрузка…' : adminUsers.length ? 'Никого не найдено' : 'Пусто'}
+                </div>
               )}
             </div>
+
+            <details className="admin-audit">
+              <summary>Журнал действий ({adminActions.length})</summary>
+              <div className="admin-audit-list">
+                {adminActions.map((a) => (
+                  <div className="admin-audit-row" key={a.id}>
+                    <span className="admin-audit-time">{fmtTsLocal(a.createdAt)}</span>
+                    <span>
+                      @{a.adminName || '?'} · {ADMIN_ACTION_LABELS[a.action] || a.action}
+                      {a.targetName ? ` · @${a.targetName}` : ''}
+                    </span>
+                    {a.details ? <span className="admin-audit-details">{a.details}</span> : null}
+                  </div>
+                ))}
+                {adminActions.length === 0 && <div className="admin-empty">Пока пусто</div>}
+              </div>
+            </details>
+
             <div className="settings-actions">
-              <button type="button" className="settings-cancel" onClick={() => setAdminPanel(false)}>
+              <button type="button" className="settings-cancel" onClick={refreshAdmin} disabled={adminBusy}>
+                ОБНОВИТЬ
+              </button>
+              <button type="button" className="settings-save" onClick={() => setAdminPanel(false)}>
                 ЗАКРЫТЬ
               </button>
             </div>

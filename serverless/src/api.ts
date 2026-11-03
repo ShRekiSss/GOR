@@ -1054,28 +1054,173 @@ async function uploadsRead(req: Request, env: Env, user: User, rawName: string):
   return new Response(file.bytes, { headers });
 }
 
-// ---------- Админка: права разраба (бан, переминовка, лист входов) ----------
-// Фича пока только в облаке (в main.go соответствия нет — см. дорожную карту).
+// ---------- Админка: права разраба (бан, переименование, входы, журнал) ----------
+// Фича только в облаке (в main.go соответствия нет — см. дорожную карту).
+// Главный админ (id=1) может выдавать админку и удалять аккаунты; остальные
+// админы — банить/переименовывать/разлогинивать.
+const MAIN_ADMIN_ID = 1;
+
+async function adminLog(
+  env: Env, me: User, action: string, targetID: number | null,
+  targetName: string, details = '',
+): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO admin_actions (admin_id, admin_name, target_id, target_name, action, details)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).bind(me.id, me.username, targetID, targetName, action, details).run().catch(() => null);
+}
+
+async function adminTarget(env: Env, id: number) {
+  return await env.DB.prepare(
+    'SELECT id, username, is_admin, banned FROM users WHERE id = ? LIMIT 1',
+  ).bind(id).first<{ id: number; username: string; is_admin: number; banned: number }>();
+}
+
+// Полное удаление аккаунта: сообщения, реакции, истории, файлы, входы, чаты.
+// Возвращает число удалённых файлов (для журнала).
+async function deleteUserAccount(env: Env, targetID: number): Promise<number> {
+  const keys = new Set<string>();
+  const stories = await env.DB.prepare(
+    "SELECT file_key FROM stories WHERE user_id = ? AND file_key != ''",
+  ).bind(targetID).all<{ file_key: string }>();
+  for (const r of stories.results || []) keys.add(r.file_key);
+
+  const msgs = await env.DB.prepare(
+    "SELECT file_url FROM messages WHERE user_id = ? AND file_url LIKE '/uploads/%'",
+  ).bind(targetID).all<{ file_url: string }>();
+  for (const r of msgs.results || []) {
+    const name = String(r.file_url || '').split('/').pop();
+    if (name) keys.add(name);
+  }
+
+  // Реакции на сообщения юзера и его собственные реакции.
+  await env.DB.prepare(
+    'DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE user_id = ?)',
+  ).bind(targetID).run();
+  await env.DB.prepare('DELETE FROM reactions WHERE user_id = ?').bind(targetID).run();
+  await env.DB.prepare('DELETE FROM story_views WHERE user_id = ?').bind(targetID).run();
+  await env.DB.prepare(
+    'DELETE FROM story_views WHERE story_id IN (SELECT id FROM stories WHERE user_id = ?)',
+  ).bind(targetID).run();
+  await env.DB.prepare('DELETE FROM stories WHERE user_id = ?').bind(targetID).run();
+  await env.DB.prepare('DELETE FROM messages WHERE user_id = ?').bind(targetID).run();
+  await env.DB.prepare('DELETE FROM push_subscriptions WHERE user_id = ?').bind(targetID).run();
+  await env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(targetID).run();
+
+  // Бот-чат: в нём только этот юзер и бот — удаляем целиком.
+  const botChat = await env.DB.prepare(
+    "SELECT id FROM chats WHERE type = 'direct' AND title = ? LIMIT 1",
+  ).bind(`bot:${targetID}`).first<{ id: number }>();
+  if (botChat) {
+    await env.DB.prepare('DELETE FROM messages WHERE chat_id = ?').bind(botChat.id).run();
+    await env.DB.prepare('DELETE FROM chat_members WHERE chat_id = ?').bind(botChat.id).run();
+    await env.DB.prepare('DELETE FROM chats WHERE id = ?').bind(botChat.id).run();
+  }
+
+  await env.DB.prepare('DELETE FROM chat_members WHERE user_id = ?').bind(targetID).run();
+  // Личные чаты, где после выхода не осталось участников (общий чат не трогаем).
+  await env.DB.prepare(
+    `DELETE FROM chats WHERE type = 'direct' AND id != 1
+       AND NOT EXISTS (SELECT 1 FROM chat_members cm WHERE cm.chat_id = chats.id)`,
+  ).run();
+
+  for (const key of keys) {
+    // Файл мог остаться в пересланном сообщении другого юзера — не ломаем его.
+    const stillMessage = await env.DB.prepare(
+      'SELECT 1 FROM messages WHERE file_url = ? LIMIT 1',
+    ).bind(`/uploads/${key}`).first();
+    if (stillMessage) continue;
+    const stillStory = await env.DB.prepare(
+      'SELECT 1 FROM stories WHERE file_key = ? LIMIT 1',
+    ).bind(key).first();
+    if (stillStory) continue;
+    await env.DB.prepare('DELETE FROM file_chunks WHERE name = ?').bind(key).run().catch(() => null);
+    await env.DB.prepare('DELETE FROM files WHERE name = ?').bind(key).run().catch(() => null);
+  }
+
+  await env.DB.prepare('DELETE FROM users WHERE id = ?').bind(targetID).run();
+  return keys.size;
+}
+
 async function adminApi(req: Request, env: Env, me: User): Promise<Response> {
   const url = new URL(req.url);
   const path = url.pathname;
   const seg = path.split('/').filter(Boolean);
-  // seg: ['api','admin','users'] | ['api','admin','users',':id','ban'|'rename']
+  // seg: ['api','admin','users'] | ['api','admin','users',':id','ban'|'rename'|'logout'|'admin'|'delete']
+
+  // Кто сейчас на связи (Hub DO). Не критично для остального — при ошибке пусто.
+  let onlineIDs = new Set<number>();
+  try {
+    const stub = env.HUB.get(env.HUB.idFromName('hub'));
+    const resp = await stub.fetch('https://hub/online');
+    const data = await resp.json() as { ids?: number[] };
+    onlineIDs = new Set(data.ids || []);
+  } catch { /* хаб спит/недоступен */ }
+
+  if (path === '/api/admin/stats' && req.method === 'GET') {
+    const row = await env.DB.prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM users) AS users,
+         (SELECT COUNT(*) FROM users WHERE banned = 1) AS banned,
+         (SELECT COUNT(*) FROM users WHERE is_admin = 1) AS admins,
+         (SELECT COUNT(*) FROM messages) AS messages,
+         (SELECT COUNT(*) FROM chats) AS chats,
+         (SELECT COUNT(*) FROM stories WHERE expires_at > datetime('now')) AS stories,
+         (SELECT COUNT(*) FROM push_subscriptions) AS pushSubs,
+         (SELECT COUNT(*) FROM files) AS files,
+         (SELECT COALESCE(SUM(size), 0) FROM files) AS filesBytes,
+         (SELECT COUNT(*) FROM sessions WHERE expires_at > strftime('%s','now')) AS sessions`,
+    ).first<any>();
+    return json({ stats: { ...(row || {}), online: onlineIDs.size } });
+  }
+
+  if (path === '/api/admin/actions' && req.method === 'GET') {
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 30));
+    const rows = await env.DB.prepare(
+      `SELECT id, admin_id AS adminId, admin_name AS adminName,
+              target_id AS targetId, target_name AS targetName,
+              action, details, created_at AS createdAt
+       FROM admin_actions ORDER BY id DESC LIMIT ?`,
+    ).bind(limit).all<any>();
+    return json({ actions: rows.results || [] });
+  }
 
   if (path === '/api/admin/users' && req.method === 'GET') {
+    const q = (url.searchParams.get('q') || '').trim();
+    const filter = (url.searchParams.get('filter') || 'all').trim();
+    let where = '';
+    const binds: unknown[] = [];
+    if (q) {
+      where += ' AND (u.username LIKE ? OR u.display_name LIKE ?)';
+      binds.push(`%${q}%`, `%${q}%`);
+    }
+    if (filter === 'banned') where += ' AND u.banned = 1';
+    else if (filter === 'admins') where += ' AND u.is_admin = 1';
+
     const rows = await env.DB.prepare(
-      `SELECT u.id, u.username, u.avatar, u.is_admin, u.banned,
-              u.created_at,
+      `SELECT u.id, u.username, u.avatar, u.is_admin AS isAdmin, u.banned,
+              u.display_name AS displayName, u.status_text AS statusText,
+              u.status_emoji AS statusEmoji, u.searchable,
+              u.created_at AS createdAt,
               (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.expires_at > (SELECT strftime('%s','now'))) AS sessions_alive,
               (SELECT MAX(s.created_at) FROM sessions s WHERE s.user_id = u.id) AS last_login,
-              (SELECT MAX(m.timestamp) FROM messages m WHERE m.user_id = u.id) AS last_message
-       FROM users u ORDER BY u.id`,
-    ).all<any>();
-    return json({ users: rows.results || [] });
+              (SELECT MAX(m.timestamp) FROM messages m WHERE m.user_id = u.id) AS last_message,
+              (SELECT COUNT(*) FROM messages m WHERE m.user_id = u.id) AS messages_count,
+              (SELECT COUNT(*) FROM chat_members cm WHERE cm.user_id = u.id) AS chats_count
+       FROM users u
+       WHERE 1 = 1${where}
+       ORDER BY u.id`,
+    ).bind(...binds).all<any>();
+
+    const users = (rows.results || []).map((u: any) => ({ ...u, online: onlineIDs.has(u.id) }));
+    return json({ users });
   }
 
   if (seg[1] === 'admin' && seg[2] === 'users' && Number.isInteger(Number(seg[3])) && Number(seg[3]) > 0) {
     const target = Number(seg[3]);
+    const victim = await adminTarget(env, target);
+    if (!victim) return text('Пользователь не найден', 404);
+
     if (req.method === 'POST' && seg[4] === 'ban') {
       if (target === me.id) return text('Нельзя забанить самого себя', 400);
       let body: { on?: boolean };
@@ -1089,8 +1234,10 @@ async function adminApi(req: Request, env: Env, me: User): Promise<Response> {
         await env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(target).run();
         await env.DB.prepare('DELETE FROM push_subscriptions WHERE user_id = ?').bind(target).run();
       }
+      await adminLog(env, me, on ? 'ban' : 'unban', target, victim.username);
       return json({ ok: true, banned: on });
     }
+
     if (req.method === 'POST' && seg[4] === 'rename') {
       let body: { username?: string };
       try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
@@ -1101,8 +1248,43 @@ async function adminApi(req: Request, env: Env, me: User): Promise<Response> {
       ).bind(name).first<{ id: number }>();
       if (exists && exists.id !== target) return text('Это имя уже занято', 409);
       await env.DB.prepare('UPDATE users SET username = ? WHERE id = ?').bind(name, target).run();
+      await adminLog(env, me, 'rename', target, name, `было: ${victim.username}`);
       return json({ ok: true, user: await profileOf(env, target) });
     }
+
+    // Принудительный выход: убиваем все сессии (пуш остаётся).
+    if (req.method === 'POST' && (seg[4] === 'logout' || seg[4] === 'sessions')) {
+      const res = await env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(target).run();
+      await adminLog(env, me, 'logout', target, victim.username, `сессий: ${res.meta.changes || 0}`);
+      return json({ ok: true, cleared: res.meta.changes || 0 });
+    }
+
+    // Выдача/снятие админки — только главный админ (id=1).
+    if (req.method === 'POST' && seg[4] === 'admin') {
+      if (me.id !== MAIN_ADMIN_ID) return text('Только главный админ может менять права', 403);
+      if (target === MAIN_ADMIN_ID || target === me.id) return text('Нельзя менять права главного админа', 400);
+      let body: { on?: boolean };
+      try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
+      const on = body.on !== false;
+      await env.DB.prepare('UPDATE users SET is_admin = ? WHERE id = ?').bind(on ? 1 : 0, target).run();
+      await adminLog(env, me, on ? 'admin_on' : 'admin_off', target, victim.username);
+      return json({ ok: true, isAdmin: on });
+    }
+
+    // Удаление аккаунта — только главный админ, с подтверждением ником.
+    if (req.method === 'POST' && seg[4] === 'delete') {
+      if (me.id !== MAIN_ADMIN_ID) return text('Только главный админ может удалять аккаунты', 403);
+      if (target === MAIN_ADMIN_ID || target === me.id) return text('Нельзя удалить главного админа', 400);
+      let body: { confirm?: string };
+      try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
+      if (String(body.confirm || '').trim() !== victim.username) {
+        return text('Для удаления введите ник точно', 400);
+      }
+      const files = await deleteUserAccount(env, target);
+      await adminLog(env, me, 'delete', null, victim.username, `файлов: ${files}`);
+      return json({ ok: true, deleted: victim.username, files });
+    }
+
     return text('Method not allowed', 405);
   }
 
