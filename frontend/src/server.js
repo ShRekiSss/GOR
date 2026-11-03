@@ -6,6 +6,42 @@ import { getToken } from './auth';
 
 const STORAGE_KEY = 'gor_server_url';
 
+// Запасные входы: тот же Worker на нескольких хостах. Если основной домен
+// не открывается у провайдера — пользователь открывает зеркало, данные те же.
+export const MIRRORS = [
+  'https://vaksa.space',
+  'https://m.vaksa.space',
+  'https://app.vaksa.space',
+  'https://chat.vaksa.space',
+  'https://www.vaksa.space',
+];
+
+// Короткая подпись зеркала для кнопок: vaksa.space / m.vaksa.space …
+export function mirrorLabel(url) {
+  try {
+    return new URL(url).host;
+  } catch (e) {
+    return String(url || '');
+  }
+}
+
+// Текущий origin страницы (в Tauri его нет — там адрес задаётся вручную).
+export function currentOrigin() {
+  if (typeof window === 'undefined') return '';
+  const { protocol, origin } = window.location;
+  return protocol === 'http:' || protocol === 'https:' ? origin : '';
+}
+
+// Список зеркал с текущим origin первым (если он http/https).
+export function mirrorList() {
+  const origin = currentOrigin();
+  const out = origin ? [origin] : [];
+  for (const m of MIRRORS) {
+    if (!out.includes(m)) out.push(m);
+  }
+  return out;
+}
+
 export function normalizeServer(raw) {
   let value = (raw || '').trim();
   if (!value) return '';

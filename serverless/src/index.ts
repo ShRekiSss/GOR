@@ -14,7 +14,7 @@ export default {
   },
 };
 
-const VERSION_DEFAULT = '1.0.6-beta';
+const VERSION_DEFAULT = '1.0.7-beta';
 
 function corsHeaders(req: Request, env: Env): Record<string, string> {
   const originHeader = req.headers.get('Origin');

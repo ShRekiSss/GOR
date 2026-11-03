@@ -2953,3 +2953,56 @@ input {
 .call-btn.big.on { background: rgba(46, 166, 255, 0.3); border-color: #2ea6ff; }
 .call-btn.big.reject { background: rgba(224, 87, 74, 0.4); border-color: #e0574a; }
 .call-btn.cam.off, .call-btn.screen.off { opacity: 0.75; }
+
+/* ---------- v1.0.7: запасные входы (зеркала) ---------- */
+.mirror-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0;
+}
+.mirror-chips.compact {
+  display: inline-flex;
+  flex-wrap: wrap;
+  margin: 0;
+}
+.mirror-chip {
+  border: 1px solid rgba(46, 166, 255, 0.45);
+  background: rgba(46, 166, 255, 0.12);
+  color: #9fd4ff;
+  border-radius: 999px;
+  padding: 5px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.mirror-chip:hover { background: rgba(46, 166, 255, 0.22); }
+.mirror-chip.current {
+  border-color: rgba(87, 227, 137, 0.55);
+  background: rgba(87, 227, 137, 0.12);
+  color: #57e389;
+  cursor: default;
+}
+.auth-mirrors {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  justify-content: center;
+}
+.server-down-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: rgba(224, 87, 74, 0.16);
+  border-bottom: 1px solid rgba(224, 87, 74, 0.5);
+  color: #ffb3aa;
+  font-size: 12px;
+  position: sticky;
+  top: 0;
+  z-index: 60;
+}
+.server-down-banner .sdb-text { font-weight: 600; }

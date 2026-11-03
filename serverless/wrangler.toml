@@ -2,10 +2,20 @@ name = "vaksa-api"
 main = "src/index.ts"
 compatibility_date = "2026-09-30"
 
-# Публичный домен: Worker со статикой и API на одном адресе.
+# Публичные домены: Worker со статикой и API на одном адресе.
+# Основной + запасные входы (зеркала): если провайдер режет один хост,
+# пользователь открывает другой — это тот же Worker, та же D1, тот же WS.
 routes = [
   { pattern = "vaksa.space", custom_domain = true },
+  { pattern = "www.vaksa.space", custom_domain = true },
+  { pattern = "m.vaksa.space", custom_domain = true },
+  { pattern = "app.vaksa.space", custom_domain = true },
+  { pattern = "chat.vaksa.space", custom_domain = true },
 ]
+
+# CORS: разрешаем переключение API между зеркалами (Bearer-токен, без cookie).
+[vars]
+ORIGINS = "https://vaksa.space,https://www.vaksa.space,https://m.vaksa.space,https://app.vaksa.space,https://chat.vaksa.space"
 
 # Облачная БД (замена chat.db); файлы — чанками в самой D1 (см. file_chunks).
 [[d1_databases]]

@@ -2,8 +2,11 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css';
 import {
   apiUrl,
+  currentOrigin,
   getServer,
   isDesktop,
+  mirrorLabel,
+  mirrorList,
   normalizeServer,
   resolveUrl,
   serverWsUrl,
@@ -97,6 +100,7 @@ function App() {
   const [serverDraft, setServerDraft] = useState(getServer());
   const [serverError, setServerError] = useState('');
   const [showServerSetup, setShowServerSetup] = useState(false);
+  const [serverDown, setServerDown] = useState(false);
   const wsRef = useRef(null);
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -461,6 +465,40 @@ function App() {
 
     return () => {
       cancelled = true;
+    };
+  }, [server]);
+
+  // Живой индикатор доступности сервера: раз в 30 секунд дергаем /api/health.
+  // Если основной домен лёг/заблокирован — показываем баннер с зеркалами.
+  useEffect(() => {
+    if (isDesktop() && !server) return undefined;
+    let stopped = false;
+    let timer = null;
+    const ping = async () => {
+      let ctrl = null;
+      let abortTimer = null;
+      try {
+        if (typeof AbortController !== 'undefined') {
+          ctrl = new AbortController();
+          abortTimer = setTimeout(() => { try { ctrl.abort(); } catch (e) { /* уже */ } }, 8000);
+        }
+        const response = await fetch(apiUrl('/api/health'), {
+          cache: 'no-store',
+          signal: ctrl ? ctrl.signal : undefined,
+        });
+        if (!stopped) setServerDown(!response.ok);
+      } catch (e) {
+        // Сеть/таймаут — сервер недоступен, но из аккаунта не выкидываем.
+        if (!stopped) setServerDown(true);
+      } finally {
+        if (abortTimer) clearTimeout(abortTimer);
+      }
+    };
+    ping();
+    timer = setInterval(ping, 30000);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
     };
   }, [server]);
 
@@ -1256,21 +1294,47 @@ function App() {
 
   const applyServer = (value) => {
     const normalized = normalizeServer(value);
-    if (!normalized) {
-      setServerError('Укажите адрес сервера');
-      return;
-    }
-    try {
-      // проверяем, что это корректный URL
-      new URL(normalized);
-    } catch (e) {
-      setServerError('Некорректный адрес. Пример: https://chat.example.com');
-      return;
+
+    // Браузер: «сменить сервер» = открыть выбранное зеркало целиком (тот же
+    // Worker: статика, API, WS — с одного хоста). Пусто = текущий origin.
+    if (!isDesktop()) {
+      const target = normalized || currentOrigin();
+      if (!target) {
+        setServerError('Укажите адрес сервера');
+        return;
+      }
+      try {
+        new URL(target);
+      } catch (e) {
+        setServerError('Некорректный адрес. Пример: https://vaksa.space');
+        return;
+      }
+      if (target !== currentOrigin()) {
+        window.location.href = target;
+        return;
+      }
+      // Текущий хост — сбрасываем ручной адрес и работаем same-origin.
+      setServer('');
+      setServerState('');
+      setServerDraft('');
+    } else {
+      if (!normalized) {
+        setServerError('Укажите адрес сервера');
+        return;
+      }
+      try {
+        // проверяем, что это корректный URL
+        new URL(normalized);
+      } catch (e) {
+        setServerError('Некорректный адрес. Пример: https://chat.example.com');
+        return;
+      }
+
+      setServer(normalized);
+      setServerState(normalized);
+      setServerDraft(normalized);
     }
 
-    setServer(normalized);
-    setServerState(normalized);
-    setServerDraft(normalized);
     setServerError('');
     if (isMobileRef.current && layersRef.current[layersRef.current.length - 1] === 'settings') {
       window.history.back();
@@ -1288,6 +1352,22 @@ function App() {
     messagesSetRef.current.clear();
     setChats([]);
     setActiveChatId(null);
+  };
+
+  // Быстрый переход на зеркало: в браузере — новый хост, в desktop — адрес API.
+  const openMirror = (url) => {
+    if (isDesktop()) {
+      applyServer(url);
+      return;
+    }
+    try {
+      new URL(url);
+    } catch (e) {
+      return;
+    }
+    if (url !== currentOrigin()) {
+      window.location.href = url;
+    }
   };
 
   const handleAuthSubmit = async (e) => {
@@ -2486,7 +2566,36 @@ function App() {
     return null;
   };
 
-  if (isDesktop() && (!server || showServerSetup)) {
+  // Кнопки-зеркала: один и тот же Worker на разных хостах.
+  const renderMirrors = (compact) => (
+    <div className={`mirror-chips ${compact ? 'compact' : ''}`}>
+      {mirrorList().map((m) => {
+        const here = m === currentOrigin();
+        return (
+          <button
+            type="button"
+            key={m}
+            className={`mirror-chip ${here ? 'current' : ''}`}
+            onClick={() => openMirror(m)}
+            title={here ? 'Текущий адрес' : `Открыть зеркало ${m}`}
+          >
+            {mirrorLabel(m)}
+            {here ? ' · сейчас' : ''}
+          </button>
+        );
+      })}
+    </div>
+  );
+
+  // Сервер не отвечает: не молчим, а сразу даём запасные входы.
+  const mirrorBanner = serverDown ? (
+    <div className="server-down-banner" role="status">
+      <span className="sdb-text">Сервер не отвечает. Запасные адреса:</span>
+      {renderMirrors(true)}
+    </div>
+  ) : null;
+
+  if (showServerSetup || (isDesktop() && !server)) {
     return (
       <div className="setup-screen">
         <form
@@ -2497,20 +2606,34 @@ function App() {
           }}
         >
           <h1>VAKSA</h1>
-          <p className="setup-subtitle">Подключение к серверу</p>
+          <p className="setup-subtitle">
+            {isDesktop() ? 'Подключение к серверу' : 'Выбор сервера / зеркала'}
+          </p>
           <input
             type="text"
             className="setup-input"
             value={serverDraft}
             onChange={(e) => setServerDraft(e.target.value)}
-            placeholder="https://chat.example.com"
+            placeholder={isDesktop() ? 'https://chat.example.com' : currentOrigin() || 'https://vaksa.space'}
             autoFocus
           />
           {serverError && <div className="setup-error">{serverError}</div>}
           <button type="submit" className="setup-button">ПОДКЛЮЧИТЬСЯ</button>
           <p className="setup-hint">
-            Например: http://192.168.0.103:8080 или https://ваш-домен
+            {isDesktop()
+              ? 'Например: http://192.168.0.103:8080 или https://ваш-домен'
+              : 'Пусто — текущий адрес. Если основной домен не открывается, выбери зеркало:'}
           </p>
+          {renderMirrors(false)}
+          {!isDesktop() && (
+            <button
+              type="button"
+              className="auth-switch"
+              onClick={() => { setShowServerSetup(false); setServerError(''); }}
+            >
+              Назад
+            </button>
+          )}
         </form>
       </div>
     );
@@ -2548,6 +2671,7 @@ function App() {
 
     return (
       <div className="setup-screen">
+        {mirrorBanner}
         <form className="setup-card auth-card" onSubmit={handleAuthSubmit}>
           <div className="auth-brand">
             <img className="auth-logo" src="/icons/icon-192.png" alt="VAKSA" />
@@ -2684,26 +2808,17 @@ function App() {
             )}
           </div>
 
-          {isDesktop() && (
-            <button
-              type="button"
-              className="auth-switch auth-serverlink"
-              onClick={() => setShowServerSetup(true)}
-            >
-              Сменить сервер: {server}
-            </button>
-          )}
-          {/* Зеркало (не vaksa.space): API маленький, а сайт-по-умолчанию —
-              другой origin; без этих кнопок зеркальные гости не подключатся. */}
-          {!isDesktop() && (
-            <button
-              type="button"
-              className="auth-switch auth-serverlink"
-              onClick={() => setShowServerSetup(true)}
-            >
-              Сменить сервер: vaksa.space
-            </button>
-          )}
+          <button
+            type="button"
+            className="auth-switch auth-serverlink"
+            onClick={() => setShowServerSetup(true)}
+          >
+            Сменить сервер: {isDesktop() ? (server || 'не выбран') : (currentOrigin() || 'vaksa.space')}
+          </button>
+          <div className="auth-mirrors">
+            <span className="auth-hint">Зеркала:</span>
+            {renderMirrors(true)}
+          </div>
         </form>
       </div>
     );
@@ -2711,6 +2826,7 @@ function App() {
 
   return (
     <div className={`app-shell ${isMobile ? 'mobile' : ''}`}>
+      {mirrorBanner}
       {/* Глобальная полоса звонка — видна из ЛЮБОГО экрана (чаты, профиль,
           настройки), не пропадает при выходе из чата. */}
       {call && call.status !== 'ringing' && (
@@ -3489,9 +3605,12 @@ function App() {
               className="setup-input"
               value={serverDraft}
               onChange={(e) => setServerDraft(e.target.value)}
-              placeholder="https://chat.example.com"
+              placeholder={isDesktop() ? 'https://chat.example.com' : (currentOrigin() || 'https://vaksa.space')}
             />
             {serverError && <div className="setup-error">{serverError}</div>}
+
+            <div className="settings-label">Зеркала (если основной домен не открывается)</div>
+            {renderMirrors(false)}
 
             {isDesktop() && (
               <label className="settings-check">
