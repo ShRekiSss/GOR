@@ -171,6 +171,7 @@ function App() {
   const [adminActions, setAdminActions] = useState([]);
   const [adminQuery, setAdminQuery] = useState('');
   const [adminFilter, setAdminFilter] = useState('all');
+  const [adminPrompt, setAdminPrompt] = useState(null); // { mode: 'delete'|'rename', user, input }
   // Профиль WeChat-стиля: свой (редактируемый) или чужой (публичная карточка).
   const [profileOpen, setProfileOpen] = useState(false);
   const [profileData, setProfileData] = useState(null);
@@ -1135,39 +1136,6 @@ function App() {
       if (activeChatId) {
         try { localStorage.removeItem(`draft-${activeChatId}`); } catch { /* ок */ }
       }
-      return;
-    }
-
-    // Чат с ботом: вопрос уходит в /api/ai (сервер сохранит вопрос и ответ).
-    if (activeChat?.isBot) {
-      const text = inputValue.trim();
-      setInputValue('');
-      setReplyTo(null);
-      if (activeChatId) {
-        try { localStorage.removeItem(`draft-${activeChatId}`); } catch { /* ок */ }
-      }
-      (async () => {
-        setTypingUser('VAKSA-бот');
-        try {
-          const r = await authFetch('/api/ai', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chatId: activeChatId, text }),
-          });
-          if (!r.ok) {
-            if (r.status === 503) throw new Error('VAKSA-бот отключён на сервере');
-            const raw = await r.text();
-            let msg = 'Бот не отвечает';
-            try { msg = JSON.parse(raw).error || msg; } catch { if (raw.trim()) msg = raw.trim(); }
-            throw new Error(msg);
-          }
-        } catch (err) {
-          setInputValue(text); // не теряем набранный вопрос при ошибке
-          showToast(`${err.message}`);
-        } finally {
-          setTypingUser('');
-        }
-      })();
       return;
     }
 
@@ -2441,11 +2409,7 @@ function App() {
     await adminPost(u.id, 'ban', { on }, on ? 'Забанен' : 'Разбанен');
   };
 
-  const adminRename = async (u) => {
-    const name = window.prompt('Новый ник (латиница/цифры/_.- 3-32):', u.username || '');
-    if (!name || name.trim() === u.username) return;
-    await adminPost(u.id, 'rename', { username: name.trim() }, 'Переименован');
-  };
+  const adminRename = (u) => setAdminPrompt({ mode: 'rename', user: u, input: u.username || '' });
 
   const adminLogout = async (u) => {
     if (!window.confirm(`Разлогинить @${u.username} на всех устройствах?`)) return;
@@ -2458,16 +2422,20 @@ function App() {
     await adminPost(u.id, 'admin', { on }, on ? 'Права выданы' : 'Права сняты');
   };
 
-  const adminDelete = async (u) => {
-    const typed = window.prompt(
-      `Удалить @${u.username} НАВСЕГДА?\n`
-      + 'Удалятся сообщения, истории, файлы и входы. Это необратимо.\n'
-      + 'Введите ник для подтверждения:',
-      '',
-    );
-    if (typed === null) return;
-    if (typed.trim() !== u.username) { showToast('Ник не совпал — отмена'); return; }
-    await adminPost(u.id, 'delete', { confirm: typed.trim() }, `Удалён @${u.username}`);
+  const adminDelete = (u) => setAdminPrompt({ mode: 'delete', user: u, input: '' });
+
+  const submitAdminPrompt = async () => {
+    const { mode, user: target, input } = adminPrompt;
+    const value = input.trim();
+    if (mode === 'rename') {
+      if (!value || value === target.username) { setAdminPrompt(null); return; }
+      setAdminPrompt(null);
+      await adminPost(target.id, 'rename', { username: value }, 'Переименовано');
+      return;
+    }
+    if (value !== target.username) { showToast('Ник не совпал - отмена'); return; }
+    setAdminPrompt(null);
+    await adminPost(target.id, 'delete', { confirm: value }, `Удалён @${target.username}`);
   };
 
   // Вкл/выкл Web Push: подписка в SW + учётная запись на сервере.
@@ -4396,6 +4364,35 @@ function App() {
               </button>
               <button type="button" className="settings-save" onClick={() => setAdminPanel(false)}>
                 ЗАКРЫТЬ
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {adminPrompt && (
+        <div className="settings-overlay" onClick={() => setAdminPrompt(null)}>
+          <div className="settings-card admin-prompt-card" onClick={(e) => e.stopPropagation()}>
+            <h2>{adminPrompt.mode === 'delete' ? 'Удаление аккаунта' : 'Смена ника'}</h2>
+            {adminPrompt.mode === 'delete' ? (
+              <p className="admin-sub">
+                Удаляются сообщения, истории, файлы и сессии @{adminPrompt.user.username}. Не восстановимо.
+                Введите ник для подтверждения:
+              </p>
+            ) : (
+              <p className="admin-sub">Новый ник (латиница/цифры/_.- , 3-32):</p>
+            )}
+            <input
+              type="text"
+              className="input-field admin-prompt-input"
+              value={adminPrompt.input}
+              onChange={(e) => setAdminPrompt({ ...adminPrompt, input: e.target.value })}
+              onKeyDown={(e) => { if (e.key === 'Enter') submitAdminPrompt(); }}
+              autoFocus
+            />
+            <div className="settings-actions">
+              <button type="button" className="settings-cancel" onClick={() => setAdminPrompt(null)}>Отмена</button>
+              <button type="button" className="settings-save" onClick={submitAdminPrompt}>
+                {adminPrompt.mode === 'delete' ? 'Удалить навсегда' : 'Переименовать'}
               </button>
             </div>
           </div>

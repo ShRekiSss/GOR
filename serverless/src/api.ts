@@ -451,16 +451,6 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
     }
     if (!(await limitOk(env, user.id, 'ai'))) return text('Слишком много запросов к боту, попробуйте позже', 429);
 
-    // Бот — обычный юзер в users, создаётся при первом обращении.
-    const botRow = await env.DB.prepare(
-      `INSERT INTO users (username, password_hash) VALUES ('VAKSA-бот', ?)
-       ON CONFLICT(username) DO NOTHING`,
-    ).bind(await hashPassword(`bot-${Date.now()}`)).run();
-    const bot = await env.DB.prepare(
-      "SELECT id, username, avatar FROM users WHERE username = 'VAKSA-бот' LIMIT 1",
-    ).first<{ id: number; username: string; avatar: string }>();
-    if (!bot) return text('Не удалось создать бота', 500);
-
     // Вопрос юзера — как обычное сообщение (видно в истории чата).
     const asked = await saveAndBroadcast(env, {
       chatId: chatID, userId: user.id, username: user.username,
@@ -490,7 +480,7 @@ async function apiRest(req: Request, env: Env, user: User): Promise<Response> {
     if (!reply) return text('AI вернул пустой ответ', 502);
 
     const answer = await saveAndBroadcast(env, {
-      chatId: chatID, userId: bot.id, username: bot.username,
+      chatId: chatID, userId: 0, username: 'VAKSA AI',
       text: reply.slice(0, 4000), type: 'text', timestamp: hhmmss(),
     } as Frame);
     await broadcastOnly(env, answer);
@@ -625,56 +615,6 @@ async function apiMedia(req: Request, env: Env, user: User): Promise<Response> {
   return text('Не найдено', 404);
 }
 
-// ---------- Хелперы чатов/сообщений ----------
-
-// Служебный бот: обычный юзер в users, но в поиске людей скрыт.
-const BOT_NAME = 'VAKSA-бот';
-
-async function botUser(env: Env): Promise<{ id: number; username: string } | null> {
-  const row = await env.DB.prepare(
-    'SELECT id, username FROM users WHERE username = ? LIMIT 1',
-  ).bind(BOT_NAME).first<{ id: number; username: string }>();
-  if (row) return row;
-  // Первое обращение: создаём. Пароль случайный — вход под ботом невозможен.
-  await env.DB.prepare(
-    'INSERT INTO users (username, password_hash) VALUES (?, ?) ON CONFLICT(username) DO NOTHING',
-  ).bind(BOT_NAME, await hashPassword(`bot-${Date.now()}`)).run().catch(() => null);
-  return await env.DB.prepare(
-    'SELECT id, username FROM users WHERE username = ? LIMIT 1',
-  ).bind(BOT_NAME).first<{ id: number; username: string }>();
-}
-
-// Личный чат «юзер ↔ VAKSA-бот» — у каждого свой, создаётся автоматически.
-// Маркер в title (`bot:<id>`) защищает от дублей при гонке параллельных запросов.
-export async function ensureBotChat(env: Env, userID: number): Promise<void> {
-  const bot = await botUser(env);
-  if (!bot || bot.id === userID) return;
-  const marker = `bot:${userID}`;
-  const existing = await env.DB.prepare(
-    "SELECT id FROM chats WHERE type = 'direct' AND title = ? LIMIT 1",
-  ).bind(marker).first<{ id: number }>();
-  if (existing) return;
-  const ins = await env.DB.prepare(
-    `INSERT INTO chats (type, title, created_by)
-     SELECT 'direct', ?, ? WHERE NOT EXISTS (
-       SELECT 1 FROM chats WHERE type = 'direct' AND title = ?)`,
-  ).bind(marker, userID, marker).run().catch(() => null);
-  const chatID = ins && ins.meta.changes
-    ? Number(ins.meta.last_row_id)
-    : (await env.DB.prepare(
-        "SELECT id FROM chats WHERE type = 'direct' AND title = ? LIMIT 1",
-      ).bind(marker).first<{ id: number }>())?.id;
-  if (!chatID) return;
-  await env.DB.batch([
-    env.DB.prepare('INSERT OR IGNORE INTO chat_members (chat_id, user_id) VALUES (?, ?)').bind(chatID, userID),
-    env.DB.prepare('INSERT OR IGNORE INTO chat_members (chat_id, user_id) VALUES (?, ?)').bind(chatID, bot.id),
-  ]).catch(() => null);
-}
-
-export async function ensureGeneralChat(env: Env, userID: number) {
-  await env.DB.prepare('INSERT OR IGNORE INTO chat_members (chat_id, user_id) VALUES (1, ?)')
-    .bind(userID).run();
-}
 
 export async function isMember(env: Env, chatID: number, userID: number): Promise<boolean> {
   const row = await env.DB.prepare(
@@ -776,8 +716,6 @@ export async function getMessages(
 }
 
 export async function listChats(env: Env, userID: number) {
-  // У каждого пользователя есть личный чат с ботом (даже если AI-ключ ещё не задан).
-  await ensureBotChat(env, userID).catch(() => null);
   const rows = await env.DB.prepare(
     `SELECT c.id, c.type, c.title, cm.last_read_message_id AS last_read, cm.role AS my_role,
             (SELECT COUNT(*) FROM chat_members x WHERE x.chat_id = c.id) AS members_count
@@ -817,8 +755,6 @@ export async function listChats(env: Env, userID: number) {
         chat.peer = peer.username;
         chat.title = peer.username;
         chat.avatar = peer.avatar || '';
-        // Клиент по этому флагу шлёт сообщения не в WS, а в /api/ai.
-        chat.isBot = String(peer.username).toLowerCase() === BOT_NAME.toLowerCase();
       }
     }
     items.push({ chat, lastID });
