@@ -2,9 +2,14 @@
 // Сервер — тупой релей call_* пользователю по username, вся логика здесь:
 // getUserMedia → RTCPeerConnection → call_offer/answer/ice/hangup.
 // ICE: публичные STUN; TURN добавим позже (coturn на VPS) для тяжёлых NAT.
+// TURN можно задать извне (window.GOR_TURN = { urls, username, credential })
+// для сетей с симметричным NAT — иначе TCP-соединение висит в checking.
+const GOR_TURN = typeof window !== 'undefined' ? window.GOR_TURN : null;
+
 const RTC_CONFIG = {
   iceServers: [
     { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+    ...(GOR_TURN ? [GOR_TURN] : []),
   ],
 };
 
@@ -12,6 +17,7 @@ const MEDIA_OK = typeof navigator !== 'undefined' && !!navigator.mediaDevices?.g
 const MEDIA_SCREEN = typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getDisplayMedia;
 
 const RING_TIMEOUT = 45000; // кто-то не берёт трубку — сброс
+const CONNECT_TIMEOUT = 20000; // взяли трубку, но ICE не собран — не висим вечно
 
 // Паракдадный рингтон через Web Audio: без внешних ассетов, работает и в Tauri.
 let ringCtx = null;
@@ -97,6 +103,7 @@ export class CallEngine {
     this.status = null;     // 'ringing' | 'outgoing' | 'connecting' | 'active'
     this.pendingOffer = null; // SDP входящего вызова
     this.ringTimer = null;
+    this.connectTimer = null;
     this.muted = false;
     this.iceOpen = false;   // зовём addIceCandidate только после setRemote
     this.queueIce = [];
@@ -273,6 +280,7 @@ export class CallEngine {
     const offer = this.pendingOffer;
     this.status = 'connecting';
     this.emit(this.currentState());
+    this.armConnectTimeout();
     try {
       this.local = await this._getUserMedia(true);
       this.pc = new RTCPeerConnection(RTC_CONFIG);
@@ -505,6 +513,7 @@ export class CallEngine {
       case 'call_answer':
         if (this.pc && ev.sdp) {
           this.status = 'connecting';
+          this.armConnectTimeout();
           this.pc.setRemoteDescription(new RTCSessionDescription(ev.sdp))
             .then(() => {
               this.iceOpen = true;
@@ -568,6 +577,13 @@ export class CallEngine {
         this.sendSignal({ type: 'call_ice', to: this.peer, candidate: e.candidate });
       }
     };
+    // Некоторые браузеры не обновляют connectionState, но сообщают failed здесь.
+    this.pc.oniceconnectionstatechange = () => {
+      if (this.pc && this.pc.iceConnectionState === 'failed' && this.status !== 'active') {
+        this.emit(null, 'Не удалось соединиться — проверьте сеть');
+        this.hangup();
+      }
+    };
     this.pc.ontrack = (e) => {
       this.remote = e.streams[0];
       // Поток появился — перенастраиваем громкость (граф создаётся лениво).
@@ -578,6 +594,8 @@ export class CallEngine {
       const st = this.pc.connectionState;
       if (st === 'connected') {
         stopRingLoop();
+        this.clearConnectTimeout();
+        clearTimeout(this.ringTimer);
         this.status = 'active';
         // После соединения разрешаем ренеготиацию (добавление камеры/экрана
         // в аудио-звонок) — до этого addTrack-рено бы ломали первичный оффер.
@@ -614,7 +632,23 @@ export class CallEngine {
     }
   }
 
+  armConnectTimeout() {
+    this.clearConnectTimeout();
+    this.connectTimer = setTimeout(() => {
+      if (this.status !== 'connecting') return;
+      this.emit(null, 'Не удалось соединиться — проверьте сеть');
+      try { this.sendSignal({ type: 'call_hangup', to: this.peer }); } catch { /* уже */ }
+      this.endLocal(true);
+    }, CONNECT_TIMEOUT);
+  }
+
+  clearConnectTimeout() {
+    if (this.connectTimer) clearTimeout(this.connectTimer);
+    this.connectTimer = null;
+  }
+
   endLocal(silent) {
+    this.clearConnectTimeout();
     try { this.pc && this.pc.close(); } catch { /* уже */ }
     this.pc = null;
     try {

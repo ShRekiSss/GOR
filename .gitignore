@@ -21,6 +21,8 @@ data/
 # окружение и редакторы
 .env
 .env.local
+.wrangler/
+serverless/.wrangler/
 .idea/
 .vscode/
 *.swp

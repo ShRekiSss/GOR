@@ -2,7 +2,18 @@ VERSION ?= 1.0.4
 LDFLAGS  = -s -w -X main.version=$(VERSION)
 OUT      = dist
 
-.PHONY: all frontend server linux windows dist clean dev desktop desktop-windows
+.PHONY: all frontend server linux windows dist clean dev desktop desktop-windows test test-calls test-admin smoke
+
+test: test-calls test-admin smoke
+
+test-calls:
+	node scripts/test-calls-timeout.js
+
+test-admin:
+	node scripts/test-admin-cleanup.js
+
+smoke: server
+	node scripts/smoketest.js
 
 all: dist
 

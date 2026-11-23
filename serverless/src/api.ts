@@ -1505,21 +1505,21 @@ async function adminApi(req: Request, env: Env, me: User): Promise<Response> {
     const victim = await adminTarget(env, target);
     if (!victim) return text('Пользователь не найден', 404);
 
+    // Бан = безвозвратное удаление аккаунта, а не временная блокировка.
     if (req.method === 'POST' && seg[4] === 'ban') {
-      if (target === me.id) return text('Нельзя забанить самого себя', 400);
-      let body: { on?: boolean };
-      try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
-      const on = body.on !== false;
-      await env.DB.prepare(
-        `UPDATE users SET banned = ? WHERE id = ?`,
-      ).bind(on ? 1 : 0, target).run();
-      if (on) {
-        // Бан убивает входы: живые сессии и пуш-подписки зануляем.
-        await env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(target).run();
-        await env.DB.prepare('DELETE FROM push_subscriptions WHERE user_id = ?').bind(target).run();
+      if (target === me.id) return text('Нельзя удалить самого себя', 400);
+      if (target === MAIN_ADMIN_ID && me.id !== MAIN_ADMIN_ID) {
+        return text('Нельзя трогать главного админа', 403);
       }
-      await adminLog(env, me, on ? 'ban' : 'unban', target, victim.username);
-      return json({ ok: true, banned: on });
+      let body: { confirm?: string };
+      try { body = await req.json(); } catch { return text('Некорректный запрос', 400); }
+      if (String(body.confirm || '').trim() !== victim.username) {
+        return text('Для безвозвратного удаления введите ник точно', 400);
+      }
+      const files = await deleteUserAccount(env, target);
+      await adminLog(env, me, 'ban_delete', null, victim.username,
+        `безвозвратно, файлов: ${files}`);
+      return json({ ok: true, deleted: victim.username, permanent: true, files });
     }
 
     if (req.method === 'POST' && seg[4] === 'rename') {

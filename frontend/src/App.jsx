@@ -21,8 +21,9 @@ const MOBILE_MQ = '(max-width: 820px)';
 
 // Подписи действий в журнале админки.
 const ADMIN_ACTION_LABELS = {
-  ban: 'бан',
-  unban: 'разбан',
+  ban: 'бан (удаление)',
+  ban_delete: 'бан (удаление навсегда)',
+  unban: 'разбан (устаревшее)',
   rename: 'переименование',
   admin_on: 'выдал админку',
   admin_off: 'снял админку',
@@ -171,7 +172,8 @@ function App() {
   const [adminActions, setAdminActions] = useState([]);
   const [adminQuery, setAdminQuery] = useState('');
   const [adminFilter, setAdminFilter] = useState('all');
-  const [adminPrompt, setAdminPrompt] = useState(null); // { mode: 'delete'|'rename', user, input }
+  const [adminSort, setAdminSort] = useState('id');
+  const [adminPrompt, setAdminPrompt] = useState(null); // { mode: 'ban'|'delete'|'rename', user, input }
   // Профиль WeChat-стиля: свой (редактируемый) или чужой (публичная карточка).
   const [profileOpen, setProfileOpen] = useState(false);
   const [profileData, setProfileData] = useState(null);
@@ -2403,11 +2405,8 @@ function App() {
     }
   };
 
-  const adminBan = async (u) => {
-    const on = !u.banned;
-    if (on && !window.confirm(`Забанить @${u.username}? Все его сессии будут убиты.`)) return;
-    await adminPost(u.id, 'ban', { on }, on ? 'Забанен' : 'Разбанен');
-  };
+  // Бан больше не «временная блокировка»: это безвозвратное удаление аккаунта.
+  const adminBan = (u) => setAdminPrompt({ mode: 'ban', user: u, input: '' });
 
   const adminRename = (u) => setAdminPrompt({ mode: 'rename', user: u, input: u.username || '' });
 
@@ -2435,6 +2434,10 @@ function App() {
     }
     if (value !== target.username) { showToast('Ник не совпал - отмена'); return; }
     setAdminPrompt(null);
+    if (mode === 'ban') {
+      await adminPost(target.id, 'ban', { confirm: value }, `Удалён навсегда @${target.username}`);
+      return;
+    }
     await adminPost(target.id, 'delete', { confirm: value }, `Удалён @${target.username}`);
   };
 
@@ -2878,6 +2881,10 @@ function App() {
     if (adminFilter === 'admins') return !!u.isAdmin;
     if (adminFilter === 'banned') return !!u.banned;
     return true;
+  }).sort((a, b) => {
+    if (adminSort === 'name') return String(a.username || '').localeCompare(String(b.username || ''));
+    if (adminSort === 'activity') return String(b.last_login || '').localeCompare(String(a.last_login || ''));
+    return Number(a.id) - Number(b.id);
   });
 
   if (showServerSetup || (isDesktop() && !server)) {
@@ -4255,6 +4262,17 @@ function App() {
                 onChange={(e) => setAdminQuery(e.target.value)}
                 placeholder="Поиск по нику или имени…"
               />
+              <select
+                className="admin-sort"
+                value={adminSort}
+                onChange={(e) => setAdminSort(e.target.value)}
+                aria-label="Сортировка пользователей"
+              >
+                <option value="id">по ID</option>
+                <option value="name">по нику</option>
+                <option value="activity">по активности</option>
+              </select>
+              <span className="admin-count">Показано {adminFiltered.length} из {adminUsers.length}</span>
             </div>
             <div className="admin-filters">
               {[
@@ -4310,12 +4328,8 @@ function App() {
                     </button>
                     <button type="button" onClick={() => adminRename(u)}>ник</button>
                     {u.id !== user?.id && (
-                      <button
-                        type="button"
-                        className={u.banned ? 'ok' : 'danger'}
-                        onClick={() => adminBan(u)}
-                      >
-                        {u.banned ? 'разбанить' : 'бан'}
+                      <button type="button" className="danger" onClick={() => adminBan(u)}>
+                        бан = удалить
                       </button>
                     )}
                     {u.id !== user?.id && (
@@ -4372,11 +4386,14 @@ function App() {
       {adminPrompt && (
         <div className="settings-overlay" onClick={() => setAdminPrompt(null)}>
           <div className="settings-card admin-prompt-card" onClick={(e) => e.stopPropagation()}>
-            <h2>{adminPrompt.mode === 'delete' ? 'Удаление аккаунта' : 'Смена ника'}</h2>
-            {adminPrompt.mode === 'delete' ? (
+            <h2>
+              {adminPrompt.mode === 'ban' ? 'Бан = удалить навсегда'
+                : adminPrompt.mode === 'delete' ? 'Удаление аккаунта' : 'Смена ника'}
+            </h2>
+            {(adminPrompt.mode === 'ban' || adminPrompt.mode === 'delete') ? (
               <p className="admin-sub">
-                Удаляются сообщения, истории, файлы и сессии @{adminPrompt.user.username}. Не восстановимо.
-                Введите ник для подтверждения:
+                Аккаунт @{adminPrompt.user.username}, его сообщения, файлы и сессии будут
+                удалены безвозвратно. Введите ник для подтверждения:
               </p>
             ) : (
               <p className="admin-sub">Новый ник (латиница/цифры/_.- , 3-32):</p>
@@ -4392,7 +4409,7 @@ function App() {
             <div className="settings-actions">
               <button type="button" className="settings-cancel" onClick={() => setAdminPrompt(null)}>Отмена</button>
               <button type="button" className="settings-save" onClick={submitAdminPrompt}>
-                {adminPrompt.mode === 'delete' ? 'Удалить навсегда' : 'Переименовать'}
+                {adminPrompt.mode === 'ban' ? 'Бан и удалить' : adminPrompt.mode === 'delete' ? 'Удалить навсегда' : 'Переименовать'}
               </button>
             </div>
           </div>

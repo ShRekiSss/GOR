@@ -8,7 +8,8 @@ const PORT = 18099;
 const BASE = `http://127.0.0.1:${PORT}`;
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gor-test-'));
 
-const server = spawn('./build/gor', [],
+const BIN = process.platform === 'win32' ? './build/gor.exe' : './build/gor';
+const server = spawn(BIN, [],
   { env: { ...process.env, GOR_PORT: String(PORT), GOR_DB: `${dir}/chat.db`, GOR_UPLOADS: `${dir}/uploads`, GOR_STATIC: `${dir}/no-static` }, cwd: process.cwd() });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
