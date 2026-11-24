@@ -144,9 +144,12 @@ npx tauri android build --ci --apk
 
 ## Проверки после правок
 
-- `make test` — три теста: `test-calls` (звонок не висит в `connecting`),
-  `test-admin` (бан = безвозвратное удаление, админка и чистота репо),
-  `smoke` (сервер, WS, чаты, история, rate-limit).
+- `make test` — тесты: `test-calls` (звонок не висит в `connecting`),
+  `test-call-signaling` (offer/answer/ICE/busy/offline + мульти-логин),
+  `test-platform-calls` (готовность ПК и Android), `test-admin`
+  (бан = безвозвратное удаление, админка и чистота репо),
+  `test-release-clients` (ассеты на GitHub Releases: состав, версии, sha256,
+  скачивание), `smoke` (сервер, WS, чаты, история, rate-limit).
 - Звонки: добавлен `CONNECT_TIMEOUT = 20 с` и обработчик `iceconnectionstate=failed`;
   при зависшем ICE звонок сбрасывается с понятным сообщением.
 - Админка: сортировка и счётчик пользователей, кнопка «бан = удалить» с
